@@ -1,0 +1,2205 @@
+<#
+    first30.ps1 - the Windows "first 30 minutes" kit for CCDC.
+    Counterpart to first30.sh.
+
+    NEW PLAYER? Right-click PowerShell > Run as administrator, go to the folder
+    with this file, then type:
+        powershell -NoProfile -ExecutionPolicy Bypass -File .\first30.ps1
+    With no mode it opens a menu. Each choice says what it does and whether it
+    changes anything. Learn mode (on in the menu) shows, for every check, where
+    to click in Windows to see the same thing yourself, and the PowerShell
+    command behind it.
+
+    Modes for the command line (the mode can be the first word, or -Mode):
+        ... -File .\first30.ps1 hunt              (add -Learn for learn mode)
+        all       start of game: snapshot + baseline + config copies + every check
+        recon     a quick picture of the box + every check (read only)
+        backup    snapshot + config copies (the first one becomes the baseline)
+        hunt      what changed since the last hunt + every check (every 30 minutes)
+        c2        programs calling out to a C2 server (watches for 30 seconds)
+        trace     -Ip <address>   where an address shows up in the logs
+        evidence  -Path <file>    copy a suspicious file into the vault, with its fingerprint
+        note      -Text "..."     add a line to the team notes;  notes  shows them
+        nets      -OurNets 10.100.130.0/24,192.168.220.0/24   save your team's networks
+        block     -Ip <address>   cut an address off, in and out (no -Ip: put saved blocks back)
+        unblock   -Ip <address>   remove a block
+        bait      -Path <file>    plant a bait file (anyone who opens it is logged)
+        quiet     stop pop-up spam (msg.exe from other machines) and RDP screen watching;  undo-quiet
+
+    Read only: recon, hunt, c2, trace, notes. They never change users, services,
+    tasks, the firewall or the registry. backup and evidence only copy things
+    into the vault. block/unblock change only their own firewall rules. bait
+    adds one file and turns on file auditing for it.
+
+    Everything is saved in C:\ProgramData\bk (change with -Vault). The vault is
+    locked so only Administrators and SYSTEM can open it.
+
+    This script is public, so assume red team has read every line. Nothing
+    secret is in it. The secret parts come from you when you run it: your own
+    networks, the addresses you block, where you plant the bait, and the seals
+    you write on paper or post in your team channel. -NoProfile stops a planted
+    PowerShell profile from swapping in fake commands before this runs.
+
+    Windows PowerShell 5.1 compatible. No downloads and no extra modules; it uses
+    the ActiveDirectory module only if it is already there (on a DC).
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Position = 0)]
+    [ValidateSet('menu','recon','backup','all','hunt','c2','trace','evidence','note','notes','nets','block','unblock','bait','quiet','undo-quiet')]
+    [string]$Mode = 'menu',
+
+    [string]$Vault = 'C:\ProgramData\bk',
+
+    [ValidateSet('dc','server','desktop','auto')]
+    [string]$Role = 'auto',
+
+    [string[]]$Ip = @(),
+
+    [string[]]$OurNets = @(),
+
+    [string]$Path = '',
+
+    [string]$Text = '',
+
+    [switch]$Learn
+)
+
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+
+# ---------------------------------------------------------------------------
+# output helpers. Everything printed goes through Clean: red team can put hidden
+# characters in names (escape codes that rewrite the screen, look-alike letters
+# from other alphabets). Here every one of them shows as a ?.
+# ---------------------------------------------------------------------------
+function Clean { param($m) if ($null -eq $m) { return '' }; return (([string]$m) -replace '[^\x09\x20-\x7E]', '?') }
+function Say  { param($m) foreach ($l in (([string]$m) -split "`r?`n")) { Write-Host (Clean $l) } }
+function Warn { param($m) foreach ($l in (([string]$m) -split "`r?`n")) { Write-Host ('[!] ' + (Clean $l)) -ForegroundColor Yellow } }
+function Good { param($m) Write-Host ('[ok] ' + (Clean $m)) -ForegroundColor Green }
+function Nxt  { param($m) Write-Host ('  Next: ' + (Clean $m)) -ForegroundColor Cyan }
+function Head { param($m) Write-Host ''; Write-Host ('==== ' + (Clean $m) + ' ====') }
+function Show { param($Rows) if ($Rows) { Say (($Rows | Format-Table -AutoSize -Wrap | Out-String -Width 220).Trim()) } }
+
+# Every check starts with Sec. Flag marks it as "something to look at" for the
+# summary at the end.
+$script:Found = New-Object System.Collections.ArrayList
+$script:Cur = ''
+$script:LearnOn = [bool]$Learn
+function Sec  { param([string]$Key, [string]$Title) $script:Cur = $Title; Head $Title; if ($script:LearnOn) { Show-Learn $Key } }
+function Flag { if (-not $script:Found.Contains($script:Cur)) { [void]$script:Found.Add($script:Cur) } }
+
+# Learn mode: where to click to see it yourself, the PowerShell command, and why.
+$LearnText = @{
+    'self'     = @('(nothing to click)', 'Get-Command Get-Process | Format-List CommandType,Source',
+                   'a planted profile or module can swap a command for a fake that hides things. -NoProfile stops that.')
+    'last'     = @('File Explorer: C:\ProgramData\bk, open two snapshot folders and compare a file', 'Compare-Object (Get-Content old\services.txt) (Get-Content new\services.txt)',
+                   'shows only the newest changes, so what red team did 10 minutes ago is not buried under the morning.')
+    'files'    = @('File Explorer: C:\Windows\System32, View > Details, sort by Date modified', 'Get-ChildItem C:\Windows\System32 -File | Sort-Object LastWriteTime -Descending | Select-Object -First 10',
+                   'new programs and scripts in system and user folders are how tools and backdoors arrive.')
+    'events'   = @('Event Viewer > Windows Logs > Security > Filter Current Log > type 4720,4732,1102', 'Get-WinEvent -FilterHashtable @{LogName=''Security''; Id=4720}',
+                   'Windows writes down new accounts, group changes, new services and cleared logs. Reports ask for these.')
+    'base'     = @('File Explorer: compare C:\ProgramData\bk\baseline with the newest snapshot folder', 'Compare-Object (Get-Content baseline\services.txt) (Get-Content <newest>\services.txt)',
+                   'everything that changed since the start of the game. Long by now; read part 1 first.')
+    'rat'      = @('Task Manager > Details; services.msc; Settings > Apps', 'Get-Process; Get-Service',
+                   'a remote-access tool is a way back in that survives password changes. It was the way in at the invitational.')
+    'c2'       = @('Resource Monitor (resmon) > Network > TCP Connections', 'Get-NetTCPConnection -State Established',
+                   'an agent has to call home. A program that keeps calling the same outside address is the one to check.')
+    'progs'    = @('Task Manager > Details > right-click a program > Properties > Digital Signatures', 'Get-AuthenticodeSignature C:\path\to\program.exe',
+                   'Windows and real software are signed. An unsigned program in a user or temp folder is how most tools arrive.')
+    'cmdline'  = @('Task Manager > Details > right-click the column headers > Select columns > Command line', 'Get-CimInstance Win32_Process | Select-Object Name,ProcessId,ParentProcessId,CommandLine',
+                   'red team hides commands in encoded PowerShell, and runs shells from the web server or SQL server.')
+    'svc'      = @('services.msc > double-click a service > Path to executable', 'Get-CimInstance Win32_Service | Select-Object Name,State,PathName',
+                   'a fake service gets a normal-sounding name. Where its program lives gives it away.')
+    'drivers'  = @('msinfo32 > Software Environment > System Drivers', 'Get-CimInstance Win32_SystemDriver | Select-Object Name,State,PathName',
+                   'a driver runs inside Windows itself. A rootkit is usually a driver.')
+    'tasks'    = @('Task Scheduler (taskschd.msc) > Task Scheduler Library > Actions tab', 'Get-ScheduledTask | Select-Object TaskName,TaskPath,State',
+                   'a scheduled task brings a backdoor back after you remove it.')
+    'persist'  = @('regedit > HKLM\SYSTEM\CurrentControlSet\Control\Lsa (and the other keys named below)', 'Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\Lsa',
+                   'these registry spots load a DLL into Windows at logon or boot. Password stealers and logon-screen backdoors live here.')
+    'wmi'      = @('(no built-in window; use PowerShell)', 'Get-CimInstance -Namespace root\subscription -ClassName __EventConsumer',
+                   'a WMI subscription runs a command when something happens, with no Run key and no task to find.')
+    'profiles' = @('File Explorer: C:\Windows\System32\WindowsPowerShell\v1.0 (look for profile.ps1)', 'Test-Path $PROFILE.AllUsersAllHosts',
+                   'a profile runs every time PowerShell starts, and can swap commands for fakes.')
+    'defender' = @('Windows Security > Virus and threat protection > Manage settings, and Exclusions', 'Get-MpComputerStatus; Get-MpPreference | Select-Object Exclusion*',
+                   'red team turns Defender off or adds an exclusion for their folder (T1562.001).')
+    'firewall' = @('wf.msc (Windows Defender Firewall with Advanced Security)', 'Get-NetFirewallProfile | Select-Object Name,Enabled',
+                   'a firewall that is off, or a new allow rule, opens the door. A new block rule can take a scored service down.')
+    'rootkit'  = @('Task Manager vs Resource Monitor; services.msc vs regedit HKLM\SYSTEM\CurrentControlSet\Services', 'Get-Process vs Get-CimInstance Win32_Process; netstat -ano vs Get-NetTCPConnection',
+                   'a rootkit can fool one way of looking, rarely all of them. When two views disagree, something is hiding.')
+    'accounts' = @('lusrmgr.msc (on a DC: Active Directory Users and Computers)', 'Get-LocalUser | Select-Object Name,Enabled,PasswordRequired',
+                   'an enabled Guest, an account with no password, or a new admin is a quiet way back in.')
+    'logins'   = @('Task Manager > Users; Computer Management > Shared Folders > Sessions', 'quser; Get-SmbSession; Get-NetTCPConnection -LocalPort 3389 -State Established',
+                   'red team logs in with real accounts (T1078). Know who is on your box, and from where.')
+    'bits'     = @('(no built-in window; use PowerShell)', 'Get-BitsTransfer -AllUsers',
+                   'BITS downloads files in the background and can run a command when it is done (T1197).')
+    'ads'      = @('(File Explorer hides them; in cmd: dir /r)', 'Get-Item C:\Users\Public\file.txt -Stream *',
+                   'a file can hide a second file inside it (an alternate data stream). Tools get hidden this way (T1564.004).')
+    'web'      = @('IIS Manager > Sites > Explore; or open C:\inetpub\wwwroot', 'Select-String -Path C:\inetpub\wwwroot\*.aspx -Pattern Process.Start',
+                   'a web shell runs any command typed into a web page, as the web server account.')
+    'ransom'   = @('File Explorer: look for .locked or .encrypted files and ransom notes', 'vssadmin list shadows',
+                   'locked files and deleted shadow copies (T1486, T1490) mean you need your backups now.')
+    'dc'       = @('Active Directory Users and Computers > right-click the domain > Find', 'Search-ADAccount -LockedOut; Get-ADUser Administrator',
+                   'locked-out users and a disabled Administrator mean red team is going after accounts (T1110, T1531).')
+    'kerberos' = @('Event Viewer > Security > Filter: 4769, then look for Ticket Encryption Type 0x17', 'Get-WinEvent -FilterHashtable @{LogName=''Security''; Id=4769} -MaxEvents 20',
+                   'many RC4 (0x17) service tickets for real accounts is Kerberoasting (T1558.003), from your AD session.')
+    'bait'     = @('Event Viewer > Security > Filter: 4663', 'Get-WinEvent -FilterHashtable @{LogName=''Security''; Id=4663} -MaxEvents 20',
+                   'nobody on your team opens the bait. If someone did, it was red team, and the log says which account and program.')
+    'spam'     = @('Event Viewer > Applications and Services Logs > Microsoft > Windows > TerminalServices-RemoteConnectionManager > Operational', 'Get-ItemProperty ''HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'' | Select-Object AllowRemoteRPC',
+                   'msg.exe floods every session with pop-ups, and RDP shadowing lets someone watch your screen while you type passwords.')
+    'audit'    = @('Event Viewer > Security (empty or tiny means auditing is off)', 'auditpol /get /category:*',
+                   'with auditing off, Windows writes down nothing for you to hunt.')
+}
+function Show-Learn {
+    param([string]$Key)
+    $t = $LearnText[$Key]
+    if (-not $t) { return }
+    Write-Host ('  [learn] click: ' + $t[0]) -ForegroundColor DarkCyan
+    Write-Host ('  [learn] type:  ' + $t[1]) -ForegroundColor DarkCyan
+    Write-Host ('  [learn] why:   ' + $t[2]) -ForegroundColor DarkCyan
+}
+
+# ---------------------------------------------------------------------------
+# basics
+# ---------------------------------------------------------------------------
+function Test-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object Security.Principal.WindowsPrincipal($id)
+    return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+}
+
+function Get-Role {
+    if ($Role -ne 'auto') { return $Role }
+    # Win32_OperatingSystem ProductType: 1 = workstation, 2 = domain controller, 3 = server
+    switch ((Get-CimInstance Win32_OperatingSystem).ProductType) {
+        2       { return 'dc' }
+        3       { return 'server' }
+        default { return 'desktop' }
+    }
+}
+
+function UtcNow { return (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm') + ' UTC' }
+
+# Only Administrators and SYSTEM may open the vault. ProgramData lets every user
+# read new folders by default, and the vault holds the baseline, notes and bait.
+function Lock-Vault {
+    $acl = Get-Acl -Path $Vault
+    if (-not $acl) { return }
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+    foreach ($sid in 'S-1-5-32-544', 'S-1-5-18') {
+        $who = New-Object System.Security.Principal.SecurityIdentifier($sid)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($who, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -Path $Vault -AclObject $acl
+}
+
+# A short fingerprint of a snapshot folder, like 3f9a-21c0-77de. Write the
+# baseline's on paper. If it ever changes, someone edited the baseline.
+function Get-Seal {
+    param([string]$Dir)
+    if (-not $Dir -or -not (Test-Path $Dir)) { return 'none' }
+    $lines = Get-ChildItem -Path $Dir -File -Recurse -Force | Sort-Object FullName | ForEach-Object {
+        (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash + ' ' + $_.FullName.Substring($Dir.Length)
+    }
+    $sha   = [System.Security.Cryptography.SHA256]::Create()
+    $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($lines -join "`n")))
+    $hex   = -join ($bytes | ForEach-Object { $_.ToString('x2') })
+    return ($hex.Substring(0,4) + '-' + $hex.Substring(4,4) + '-' + $hex.Substring(8,4))
+}
+
+# Red team can read this script, so they know which commands it uses. A planted
+# PowerShell profile or module can replace one with a fake that hides things.
+function Test-Hijack {
+    $names = 'Get-CimInstance','Get-NetTCPConnection','Get-NetUDPEndpoint','Get-NetFirewallRule','Get-NetFirewallProfile',
+             'Get-ScheduledTask','Get-ItemProperty','Get-ChildItem','Get-Item','Get-FileHash','Get-LocalUser',
+             'Get-LocalGroupMember','Get-Process','Get-Service','Get-Content','Get-Acl','Set-Acl','Get-WinEvent',
+             'Get-AuthenticodeSignature','Get-MpPreference','Get-MpComputerStatus','Get-MpThreatDetection',
+             'Get-SmbSession','Get-SmbShare','Get-BitsTransfer','Get-ADUser','Get-ADGroupMember','Get-ADComputer',
+             'Get-ADObject','Search-ADAccount','Compare-Object','Select-Object','Where-Object','Sort-Object',
+             'ForEach-Object','Group-Object','Format-Table','Out-String','Write-Host','Test-Path','Set-Content',
+             'Add-Content','Copy-Item','New-NetFirewallRule','Remove-NetFirewallRule','Start-Transcript'
+    $bad = @()
+    foreach ($n in $names) {
+        $c = Get-Command $n -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $c) { continue }
+        if ($c.CommandType -eq 'Alias') { $bad += ($n + ' (an alias for ' + $c.Definition + ')'); continue }
+        if ($c.CommandType -eq 'Function' -and -not $c.ModuleName) { $bad += ($n + ' (defined in this window)'); continue }
+        $base = ''
+        if ($c.Module) { $base = [string]$c.Module.ModuleBase }
+        if ($base -and $base -notlike "$env:windir\*" -and $base -notlike "$PSHOME*") { $bad += ($n + ' (loaded from ' + $base + ')') }
+    }
+    return $bad
+}
+
+# ---------------------------------------------------------------------------
+# addresses: checking them, your networks, and the saved block list
+# ---------------------------------------------------------------------------
+function Test-IPv4 {
+    param([string]$Text)
+    $parts = $Text -split '/'
+    if ($parts.Count -gt 2) { return $false }
+    if ($parts[0] -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { return $false }
+    foreach ($o in ($parts[0] -split '\.')) { if ([int]$o -gt 255) { return $false } }
+    if ($parts.Count -eq 2 -and -not ($parts[1] -match '^\d{1,2}$' -and [int]$parts[1] -le 32)) { return $false }
+    return $true
+}
+
+# is the IPv4 address $Addr inside $Net (an address, or address/bits)?
+function Test-InNet {
+    param([string]$Addr, [string]$Net)
+    $p = $Net -split '/'
+    $bits = 32
+    if ($p.Count -eq 2) { $bits = [int]$p[1] }
+    $x = $null; $y = $null
+    if (-not [System.Net.IPAddress]::TryParse($Addr, [ref]$x)) { return $false }
+    if (-not [System.Net.IPAddress]::TryParse($p[0], [ref]$y)) { return $false }
+    if ($x.AddressFamily -ne 'InterNetwork' -or $y.AddressFamily -ne 'InterNetwork') { return $false }
+    $xb = $x.GetAddressBytes(); [Array]::Reverse($xb)
+    $yb = $y.GetAddressBytes(); [Array]::Reverse($yb)
+    $xi = [int64][BitConverter]::ToUInt32($xb, 0)
+    $yi = [int64][BitConverter]::ToUInt32($yb, 0)
+    if ($bits -eq 0) { return $true }
+    $mask = [int64]([math]::Pow(2, 32) - [math]::Pow(2, 32 - $bits))
+    return (($xi -band $mask) -eq ($yi -band $mask))
+}
+
+# outside your networks? (no networks saved: never marked; IPv6: not compared)
+function Test-Outside {
+    param([string]$Addr)
+    if ($script:Nets.Count -eq 0) { return $false }
+    $a = ([string]$Addr) -replace '^::ffff:', ''
+    if ($a -match ':' -or -not $a) { return $false }
+    foreach ($n in $script:Nets) { if (Test-InNet $a $n) { return $false } }
+    return $true
+}
+
+function Get-BlockList {
+    if (-not (Test-Path $BlockFile)) { return @() }
+    return @(Get-Content $BlockFile | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+# ---------------------------------------------------------------------------
+# programs: where a command line's program is, signatures, risky folders
+# ---------------------------------------------------------------------------
+function Get-ExeFromCmd {
+    param([string]$Cmd)
+    if (-not $Cmd) { return '' }
+    $c = [Environment]::ExpandEnvironmentVariables($Cmd.Trim())
+    if ($c.StartsWith('"')) {
+        $e = $c.IndexOf('"', 1)
+        if ($e -gt 0) { $c = $c.Substring(1, $e - 1) }
+    } elseif ($c -match '^(?i)(.+?\.(exe|sys|dll|com|bat|cmd|ps1|vbs|js))(\s|$)') {
+        $c = $Matches[1]
+    } else {
+        $c = ($c -split ' ')[0]
+    }
+    $c = $c -replace '^\\\?\?\\', ''
+    $c = $c -replace '^(?i)\\SystemRoot\\', ($env:windir + '\')
+    if ($c -match '^(?i)system32\\') { $c = Join-Path $env:windir $c }
+    return $c
+}
+
+# Signature status of a file, remembered in the vault by path, size and date so
+# later hunts do not check every file again.
+$script:SigCache = $null
+function Get-SigStatus {
+    param([string]$File)
+    if (-not $File -or -not (Test-Path -LiteralPath $File)) { return 'Missing' }
+    if ($null -eq $script:SigCache) {
+        $script:SigCache = @{}
+        $cf = Join-Path $Vault '.sigcache.txt'
+        if (Test-Path $cf) { foreach ($l in (Get-Content $cf)) { $k = $l.LastIndexOf('|'); if ($k -gt 0) { $script:SigCache[$l.Substring(0, $k)] = $l.Substring($k + 1) } } }
+    }
+    $fi = Get-Item -LiteralPath $File -Force
+    $key = $File.ToLower() + '|' + $fi.Length + '|' + $fi.LastWriteTimeUtc.Ticks
+    if ($script:SigCache.ContainsKey($key)) { return $script:SigCache[$key] }
+    $st = [string](Get-AuthenticodeSignature -LiteralPath $File).Status
+    if (-not $st) { $st = 'Unknown' }
+    $script:SigCache[$key] = $st
+    Add-Content -Path (Join-Path $Vault '.sigcache.txt') -Value ($key + '|' + $st)
+    return $st
+}
+
+$script:BadPath = @('\temp\', '\tmp\', '\appdata\', '\users\public\', '\programdata\', '\downloads\', '\$recycle.bin\', '\perflogs\', '\windows\tasks\', '\windows\debug\', '\windows\fonts\')
+function Test-UserWritable {
+    param([string]$P)
+    $low = ([string]$P).ToLower()
+    if ($low -like '*\programdata\microsoft\windows defender\*') { return $false }
+    foreach ($b in $script:BadPath) { if ($low.Contains($b)) { return $true } }
+    return $false
+}
+
+# ---------------------------------------------------------------------------
+# events: "what happened since the last hunt" straight from the Windows logs
+# ---------------------------------------------------------------------------
+function XSince {
+    param([int[]]$Ids, [datetime]$Since, [string]$Extra = '')
+    $ms = [int64]((Get-Date) - $Since).TotalMilliseconds
+    if ($ms -lt 60000) { $ms = 60000 }
+    $idq = ($Ids | ForEach-Object { 'EventID=' + $_ }) -join ' or '
+    $q = '*[System[(' + $idq + ') and TimeCreated[timediff(@SystemTime) <= ' + $ms + ']]]'
+    if ($Extra) { $q += ' and *[EventData[' + $Extra + ']]' }
+    return $q
+}
+function Get-Evt {
+    param([string]$Log, [string]$XPath, [int]$Max = 500)
+    try { return @(Get-WinEvent -LogName $Log -FilterXPath $XPath -MaxEvents $Max -ErrorAction Stop) } catch { return @() }
+}
+function EvMap {
+    param($E)
+    $h = @{}
+    try { $x = [xml]$E.ToXml(); foreach ($d in @($x.Event.EventData.Data)) { if ($d.Name) { $h[[string]$d.Name] = [string]$d.'#text' } } } catch {}
+    $h['Time'] = $E.TimeCreated
+    return $h
+}
+function EvData {
+    param($E, [string]$Name)
+    try {
+        $x = [xml]$E.ToXml()
+        foreach ($d in @($x.Event.EventData.Data)) { if ($d.Name -eq $Name) { return [string]$d.'#text' } }
+        $n = $x.SelectSingleNode("//*[local-name()='" + $Name + "']")
+        if ($n) { return [string]$n.InnerText }
+    } catch {}
+    return ''
+}
+
+# ---------------------------------------------------------------------------
+# listening ports with the program and account behind each one
+# ---------------------------------------------------------------------------
+# For a Windows service the account is its logon account: LocalSystem,
+# NT AUTHORITY\NetworkService, NT SERVICE\..., or a real account like
+# DOMAIN\svc_sql. Real accounts that run services are what Kerberoasting targets.
+# TCP: every listener. UDP: well-known ports only (under 1024), because a DNS
+# server alone opens thousands of high UDP ports.
+function Get-ListenInfo {
+    param([switch]$NoPid)
+    $svcByPid = @{}
+    foreach ($s in @(Get-CimInstance Win32_Service | Where-Object { $_.ProcessId -gt 0 })) {
+        $k = [int]$s.ProcessId
+        if (-not $svcByPid.ContainsKey($k)) { $svcByPid[$k] = @() }
+        $svcByPid[$k] += $s
+    }
+    $procById = @{}
+    foreach ($p in @(Get-CimInstance Win32_Process)) { $procById[[int]$p.ProcessId] = $p }
+    $ends = @()
+    $ends += @(Get-NetTCPConnection -State Listen | ForEach-Object {
+        [pscustomobject]@{ Proto = 'TCP'; Address = $_.LocalAddress; Port = [int]$_.LocalPort; ProcId = [int]$_.OwningProcess } })
+    $ends += @(Get-NetUDPEndpoint | Where-Object { $_.LocalPort -lt 1024 } | ForEach-Object {
+        [pscustomobject]@{ Proto = 'UDP'; Address = $_.LocalAddress; Port = [int]$_.LocalPort; ProcId = [int]$_.OwningProcess } })
+    $rows = @()
+    foreach ($e in $ends) {
+        $svcs = $svcByPid[$e.ProcId]
+        $proc = $procById[$e.ProcId]
+        $acct = ''
+        if ($e.ProcId -eq 4) {
+            $acct = 'SYSTEM (kernel)'        # PID 4: SMB 445, WinRM 5985 and other HTTP.sys ports
+        } elseif ($svcs) {
+            $acct = (@($svcs | ForEach-Object { $_.StartName }) | Sort-Object -Unique) -join ', '
+        } elseif ($proc) {
+            $o = Invoke-CimMethod -InputObject $proc -MethodName GetOwner
+            if ($o -and $o.User) { if ($o.Domain) { $acct = $o.Domain + '\' + $o.User } else { $acct = $o.User } }
+        }
+        $row = [ordered]@{ Proto = $e.Proto; Port = $e.Port; Address = $e.Address }
+        if (-not $NoPid) { $row['PID'] = $e.ProcId }
+        if ($proc) { $row['Process'] = $proc.Name } else { $row['Process'] = '?' }
+        if ($svcs) { $row['Service'] = (@($svcs | ForEach-Object { $_.Name }) | Sort-Object) -join ', ' } else { $row['Service'] = '' }
+        if ($acct) { $row['Account'] = $acct } else { $row['Account'] = '?' }
+        $rows += [pscustomobject]$row
+    }
+    $rows | Sort-Object Proto, Port, Address
+}
+
+# True when an account is a real user account rather than a built-in one.
+function Test-RealAccount {
+    param([string]$Account)
+    if (-not $Account -or $Account -eq '?') { return $false }
+    foreach ($a in ($Account -split ', ')) {
+        if ($a -notmatch '^(LocalSystem|SYSTEM \(kernel\)|NT AUTHORITY\\.*|NT SERVICE\\.*|IIS APPPOOL\\.*|Window Manager\\.*|Font Driver Host\\.*)$') { return $true }
+    }
+    return $false
+}
+
+function Get-LocalAdmins {
+    $m = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name + ' | ' + $_.ObjectClass + ' | ' + $_.PrincipalSource })
+    if ($m.Count -eq 0) {
+        # domain controllers: read the built-in Administrators group with net.exe instead
+        $m = @(net localgroup Administrators 2>$null | Select-Object -Skip 6 | Where-Object { $_ -and $_ -notmatch 'command completed' })
+    }
+    $m | Sort-Object
+}
+
+# ---------------------------------------------------------------------------
+# snapshot: one text file per item, one line per thing, so a change is one line.
+# hunt compares these with the last hunt and with the baseline.
+# ---------------------------------------------------------------------------
+function New-Snapshot {
+    $script:stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $script:SnapDir = Join-Path $Vault $script:stamp
+    New-Item -ItemType Directory -Force -Path $script:SnapDir | Out-Null
+}
+
+function Snap {
+    param([string]$Name, [scriptblock]$Block)
+    $file = Join-Path $script:SnapDir ($Name + '.txt')
+    try {
+        $out = @(& $Block 2>$null | ForEach-Object { [string]$_ })
+        Set-Content -Path $file -Value $out -Encoding UTF8
+    } catch {
+        Set-Content -Path $file -Value ('ERROR collecting ' + $Name + ': ' + $_.Exception.Message) -Encoding UTF8
+    }
+}
+
+function Get-Autoruns {
+    $keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce',
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunServices')
+    # every user who is logged in or has their registry loaded
+    foreach ($sid in @(Get-ChildItem 'Registry::HKEY_USERS' | Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' } | Select-Object -ExpandProperty PSChildName)) {
+        $keys += ('Registry::HKEY_USERS\' + $sid + '\Software\Microsoft\Windows\CurrentVersion\Run')
+        $keys += ('Registry::HKEY_USERS\' + $sid + '\Software\Microsoft\Windows\CurrentVersion\RunOnce')
+    }
+    foreach ($k in $keys) {
+        $p = Get-ItemProperty $k
+        if ($p) { $p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS(Path|ParentPath|ChildName|Drive|Provider)$' } | ForEach-Object { $k + ' | ' + $_.Name + ' | ' + $_.Value } }
+    }
+    $folders = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup")
+    $folders += @(Resolve-Path 'C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup' | ForEach-Object { $_.Path })
+    foreach ($f in $folders) {
+        Get-ChildItem -Path $f -File -Force | Where-Object { $_.Name -ne 'desktop.ini' } | ForEach-Object { 'Startup folder | ' + $_.FullName }
+    }
+}
+
+function Get-PersistSpots {
+    $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    'Winlogon Shell | ' + $wl.Shell
+    'Winlogon Userinit | ' + $wl.Userinit
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows') {
+        $ai = Get-ItemProperty $k
+        if ($ai) { 'AppInit_DLLs | ' + $k + ' | ' + $ai.AppInit_DLLs + ' | load=' + $ai.LoadAppInit_DLLs }
+    }
+    $ac = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls'
+    if ($ac) { $ac.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object { 'AppCertDlls | ' + $_.Name + ' | ' + $_.Value } }
+    'BootExecute | ' + ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager').BootExecute -join ';')
+    $lsa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+    'LSA Security Packages | ' + ($lsa.'Security Packages' -join ';')
+    'LSA OSConfig Security Packages | ' + ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\OSConfig').'Security Packages' -join ';')
+    'LSA Authentication Packages | ' + ($lsa.'Authentication Packages' -join ';')
+    'LSA Notification Packages | ' + ($lsa.'Notification Packages' -join ';')
+    'LSA RunAsPPL | ' + $lsa.RunAsPPL
+    'LSA DsrmAdminLogonBehavior | ' + $lsa.DsrmAdminLogonBehavior
+    'WDigest UseLogonCredential | ' + (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest').UseLogonCredential
+    $ns = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NetSh'
+    if ($ns) { $ns.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object { 'Netsh helper | ' + $_.Name + ' | ' + $_.Value } }
+    Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors' | ForEach-Object { 'Print monitor | ' + $_.PSChildName + ' | ' + (Get-ItemProperty $_.PSPath).Driver }
+    Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders' | ForEach-Object { 'Time provider | ' + $_.PSChildName + ' | ' + (Get-ItemProperty $_.PSPath).DllName }
+    Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options' | ForEach-Object {
+        $p = Get-ItemProperty $_.PSPath
+        if ($p.Debugger) { 'IFEO Debugger | ' + $_.PSChildName + ' | ' + $p.Debugger }
+        if ($p.GlobalFlag -and (([int]$p.GlobalFlag) -band 0x200)) { 'IFEO SilentProcessExit flag | ' + $_.PSChildName }
+    }
+    Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit' | ForEach-Object {
+        $p = Get-ItemProperty $_.PSPath
+        if ($p.MonitorProcess) { 'SilentProcessExit MonitorProcess | ' + $_.PSChildName + ' | ' + $p.MonitorProcess }
+    }
+    foreach ($f in 'sethc.exe', 'utilman.exe', 'osk.exe', 'Magnify.exe', 'Narrator.exe', 'DisplaySwitch.exe', 'AtBroker.exe') {
+        $fp = Join-Path "$env:windir\System32" $f
+        if (Test-Path $fp) { 'Accessibility program | ' + $f + ' | ' + (Get-FileHash $fp -Algorithm SHA256).Hash.Substring(0, 16) }
+    }
+}
+
+function Get-WmiPersist {
+    Get-CimInstance -Namespace root\subscription -ClassName __EventFilter | ForEach-Object { 'Filter | ' + $_.Name + ' | ' + $_.Query }
+    Get-CimInstance -Namespace root\subscription -ClassName __EventConsumer | ForEach-Object {
+        $what = $_.CommandLineTemplate
+        if (-not $what) { $what = $_.ScriptText }
+        if (-not $what) { $what = $_.ScriptFileName }
+        if (-not $what) { $what = $_.ExecutablePath }
+        'Consumer | ' + $_.CimClass.CimClassName + ' | ' + $_.Name + ' | ' + (([string]$what) -replace "`r?`n", ' ')
+    }
+    Get-CimInstance -Namespace root\subscription -ClassName __FilterToConsumerBinding | ForEach-Object { 'Binding | ' + [string]$_.Filter + ' | ' + [string]$_.Consumer }
+}
+
+function Collect-Common {
+    Head 'saving a snapshot of this box'
+    Set-Content -Path (Join-Path $script:SnapDir 'stamp.txt') -Value ('first30 snapshot of ' + $env:COMPUTERNAME + ' at ' + (UtcNow))
+
+    Snap 'localusers' {
+        $u = @(Get-LocalUser)
+        if ($u.Count -gt 0) {
+            $u | Sort-Object Name | ForEach-Object { $_.Name + ' | enabled=' + $_.Enabled + ' | password-required=' + $_.PasswordRequired + ' | password-set=' + $_.PasswordLastSet + ' | ' + $_.SID }
+        } else {
+            net user 2>$null | Select-Object -Skip 4 | Where-Object { $_ -and $_ -notmatch 'command completed' }
+        }
+    }
+    Snap 'localadmins' { Get-LocalAdmins }
+    Snap 'privgroups' {
+        foreach ($g in 'Administrators', 'Remote Desktop Users', 'Remote Management Users', 'Backup Operators', 'Power Users', 'Event Log Readers', 'Hyper-V Administrators') {
+            Get-LocalGroupMember -Group $g -ErrorAction SilentlyContinue | ForEach-Object { $g + ' | ' + $_.Name }
+        }
+    }
+    # Services: the state only for automatic ones (a stopped automatic service is
+    # news; manual ones start and stop all day). Per-user copies like
+    # CDPUserSvc_4f2a1 come and go with every logon, so they are left out.
+    Snap 'services' {
+        Get-CimInstance Win32_Service | Where-Object { $_.Name -notmatch '_[0-9a-f]{4,8}$' } | Sort-Object Name | ForEach-Object {
+            $st = ''
+            if ($_.StartMode -eq 'Auto') { $st = $_.State }
+            $_.Name + ' | ' + $_.StartMode + ' ' + $st + ' | ' + $_.StartName + ' | ' + $_.PathName
+        }
+    }
+    Snap 'drivers'     { Get-CimInstance Win32_SystemDriver | Sort-Object Name | ForEach-Object { $_.Name + ' | ' + $_.StartMode + ' | ' + $_.PathName } }
+    Snap 'tasks' {
+        Get-ScheduledTask | Sort-Object TaskPath, TaskName | ForEach-Object {
+            $st = [string]$_.State
+            if ($st -eq 'Running') { $st = 'Ready' }
+            $act = ($_.Actions | ForEach-Object { ([string]$_.Execute + ' ' + [string]$_.Arguments).Trim() }) -join '; '
+            $_.TaskPath + $_.TaskName + ' | ' + $st + ' | ' + $act
+        }
+    }
+    Snap 'listening'   { Get-ListenInfo -NoPid | ForEach-Object { $_.Proto + ' ' + $_.Port + ' ' + $_.Address + ' | ' + $_.Process + ' | ' + $_.Service + ' | ' + $_.Account } }
+    Snap 'autoruns'    { Get-Autoruns }
+    Snap 'persist'     { Get-PersistSpots }
+    Snap 'wmi_persist' { Get-WmiPersist }
+    Snap 'hostsfile'   { Get-Content "$env:windir\System32\drivers\etc\hosts" | Where-Object { $_ -and $_ -notmatch '^\s*#' } }
+    Snap 'netcfg' {
+        Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses } | ForEach-Object { 'DNS servers | ' + $_.InterfaceAlias + ' | ' + ($_.ServerAddresses -join ',') }
+        'WinHTTP proxy | ' + (((netsh winhttp show proxy) -join ' ') -replace '\s+', ' ').Trim()
+        'Machine proxy | ' + (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings').ProxyServer
+    }
+    Snap 'fwrules'     { Get-NetFirewallRule | Sort-Object DisplayName, Direction | ForEach-Object { $_.DisplayName + ' | ' + $_.Direction + ' | ' + $_.Action + ' | enabled=' + $_.Enabled + ' | ' + $_.Profile } }
+    Snap 'fwprofiles'  { Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object { $_.Name + ' | enabled=' + $_.Enabled + ' | in=' + $_.DefaultInboundAction + ' | out=' + $_.DefaultOutboundAction + ' | local-rules=' + $_.AllowLocalFirewallRules } }
+    # Defender settings red team changes to hide their tools (T1562.001)
+    Snap 'defender' {
+        $mp = Get-MpPreference
+        'ExclusionPath | ' + ($mp.ExclusionPath -join '; ')
+        'ExclusionProcess | ' + ($mp.ExclusionProcess -join '; ')
+        'ExclusionExtension | ' + ($mp.ExclusionExtension -join '; ')
+        'ExclusionIpAddress | ' + ($mp.ExclusionIpAddress -join '; ')
+        'DisableRealtimeMonitoring | ' + $mp.DisableRealtimeMonitoring
+        $st = Get-MpComputerStatus
+        if ($st) {
+            'RealTimeProtectionEnabled | ' + $st.RealTimeProtectionEnabled
+            'AntivirusEnabled | ' + $st.AntivirusEnabled
+            'BehaviorMonitorEnabled | ' + $st.BehaviorMonitorEnabled
+            'IsTamperProtected | ' + $st.IsTamperProtected
+        }
+    }
+    # shadow copies, so deleting them shows (T1490)
+    Snap 'shadowcopies' { 'shadow copies: ' + @(Get-CimInstance Win32_ShadowCopy).Count }
+    Snap 'shares'       { Get-SmbShare | Sort-Object Name | ForEach-Object { $_.Name + ' | ' + $_.Path } }
+    Snap 'software' {
+        $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        Get-ItemProperty $keys | Where-Object DisplayName | Sort-Object DisplayName | ForEach-Object { $_.DisplayName + ' | ' + $_.DisplayVersion }
+    }
+    Snap 'bits' { Get-BitsTransfer -AllUsers | ForEach-Object { $_.DisplayName + ' | ' + $_.OwnerAccount + ' | ' + (@($_.FileList) | Select-Object -First 1).RemoteName } }
+
+    # kept for the record, never compared (they change all the time)
+    Snap 'processes'   { Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine | Format-List | Out-String -Width 4096 }
+    Snap 'connections' { Get-NetTCPConnection -State Established | Select-Object LocalPort, RemoteAddress, RemotePort, OwningProcess | Format-Table -AutoSize | Out-String -Width 4096 }
+    Snap 'hotfixes'    { Get-HotFix | Select-Object HotFixID, InstalledOn | Sort-Object InstalledOn | Format-Table -AutoSize | Out-String -Width 4096 }
+    Snap 'posture' {
+        'SMBv1 enabled : ' + (Get-SmbServerConfiguration).EnableSMB1Protocol
+        'LSA RunAsPPL  : ' + (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa').RunAsPPL + '    (1 = LSASS protected against credential theft)'
+        'RDP NLA       : ' + (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp').UserAuthentication
+        '--- audit policy (must be ON or Windows writes no events to hunt) ---'
+        auditpol /get /category:* 2>$null
+    }
+    Say ('  saved in ' + $script:SnapDir)
+}
+
+function Collect-DC {
+    Head 'saving the domain snapshot (domain controller)'
+    $haveAD = $null -ne (Get-Module -ListAvailable ActiveDirectory)
+    if ($haveAD) { Import-Module ActiveDirectory -ErrorAction SilentlyContinue }
+    if (-not $haveAD) {
+        Warn 'ActiveDirectory module not present; using net.exe instead'
+        Snap 'ad_privgroups' { foreach ($g in 'Domain Admins', 'Enterprise Admins', 'Schema Admins') { net group $g /domain 2>$null | Select-Object -Skip 8 | Where-Object { $_ -and $_ -notmatch 'command completed' } | ForEach-Object { $g + ' | ' + $_.Trim() } } }
+        Snap 'ad_users' { net user /domain 2>$null }
+        return
+    }
+    Snap 'ad_privgroups' {
+        foreach ($g in 'Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Administrators', 'Account Operators', 'Backup Operators',
+                       'Server Operators', 'Print Operators', 'DnsAdmins', 'Group Policy Creator Owners', 'Protected Users', 'Remote Desktop Users') {
+            Get-ADGroupMember -Identity $g -Recursive -ErrorAction SilentlyContinue | ForEach-Object { $g + ' | ' + $_.SamAccountName + ' | ' + $_.objectClass }
+        }
+    }
+    Snap 'ad_users'  { Get-ADUser -Filter * -Properties whenCreated | Sort-Object SamAccountName | ForEach-Object { $_.SamAccountName + ' | enabled=' + $_.Enabled + ' | created=' + $_.whenCreated } }
+    Snap 'ad_spn'    { Get-ADUser -Filter 'ServicePrincipalName -like "*"' -Properties ServicePrincipalName, 'msDS-SupportedEncryptionTypes' | ForEach-Object { $_.SamAccountName + ' | ' + ($_.ServicePrincipalName -join ';') + ' | enc=' + $_.'msDS-SupportedEncryptionTypes' } }
+    Snap 'ad_asrep'  { Get-ADUser -Filter 'DoesNotRequirePreAuth -eq $true' | ForEach-Object { $_.SamAccountName } }
+    Snap 'ad_delegation' {
+        Get-ADComputer -Filter 'TrustedForDelegation -eq $true' | ForEach-Object { 'unconstrained | ' + $_.Name }
+        Get-ADObject -Filter 'msDS-AllowedToDelegateTo -like "*"' -Properties 'msDS-AllowedToDelegateTo' | ForEach-Object { 'constrained | ' + $_.Name + ' | ' + ($_.'msDS-AllowedToDelegateTo' -join ';') }
+        Get-ADObject -Filter 'msDS-AllowedToActOnBehalfOfOtherIdentity -like "*"' | ForEach-Object { 'resource-based | ' + $_.Name }
+    }
+    Snap 'ad_adminsdholder' {
+        $d = (Get-ADDomain).DistinguishedName
+        (Get-Acl ('AD:\CN=AdminSDHolder,CN=System,' + $d)).Access | ForEach-Object { [string]$_.IdentityReference + ' | ' + $_.ActiveDirectoryRights + ' | ' + $_.AccessControlType }
+    }
+    Snap 'ad_replrights' {
+        $d = (Get-ADDomain).DistinguishedName
+        (Get-Acl ('AD:\' + $d)).Access | Where-Object { $_.ObjectType -match '1131f6a' } | ForEach-Object { [string]$_.IdentityReference + ' | ' + $_.ActiveDirectoryRights + ' | ' + $_.ObjectType }
+    }
+    Snap 'ad_gpos'   { Get-GPO -All | Sort-Object DisplayName | ForEach-Object { $_.DisplayName + ' | ' + $_.Id + ' | changed ' + $_.ModificationTime } }
+    Snap 'ad_krbtgt' { $k = Get-ADUser krbtgt -Properties pwdLastSet; 'krbtgt password set | ' + [datetime]::FromFileTime($k.pwdLastSet) }
+    Snap 'ad_risky' {
+        Get-ADUser -Filter 'PasswordNotRequired -eq $true' | ForEach-Object { 'password not required | ' + $_.SamAccountName }
+        Get-ADUser -Filter 'AllowReversiblePasswordEncryption -eq $true' | ForEach-Object { 'reversible password | ' + $_.SamAccountName }
+        Get-ADUser -LDAPFilter '(sIDHistory=*)' | ForEach-Object { 'has SID history | ' + $_.SamAccountName }
+    }
+    Snap 'ad_trusts' { Get-ADTrust -Filter * | ForEach-Object { $_.Name + ' | ' + $_.Direction + ' | ' + $_.TrustType } }
+    # kept for the record
+    Snap 'ad_dclist' { Get-ADDomainController -Filter * | Select-Object Name, IPv4Address, OperatingSystem, IsGlobalCatalog | Format-Table -AutoSize | Out-String -Width 4096 }
+    Snap 'ad_recentobjects' { $cut = (Get-Date).AddDays(-2); Get-ADObject -Filter 'whenCreated -gt $cut' -Properties whenCreated | Select-Object Name, ObjectClass, whenCreated | Sort-Object whenCreated | Format-Table -AutoSize | Out-String -Width 4096 }
+}
+
+# the items hunt compares, with plain names
+$DiffItems = [ordered]@{
+    'localusers' = 'Local users'; 'localadmins' = 'Local Administrators'; 'privgroups' = 'Privileged local groups'
+    'services' = 'Services'; 'drivers' = 'Drivers'; 'tasks' = 'Scheduled tasks'; 'listening' = 'Listening ports'
+    'autoruns' = 'Run keys and Startup folders'; 'persist' = 'Other auto-start spots (LSA, Winlogon, IFEO, netsh...)'
+    'wmi_persist' = 'WMI subscriptions'; 'hostsfile' = 'hosts file'; 'netcfg' = 'DNS servers and proxy'
+    'fwrules' = 'Firewall rules'; 'fwprofiles' = 'Firewall on/off'; 'defender' = 'Defender settings'
+    'shadowcopies' = 'Shadow copies'; 'shares' = 'Shares'; 'software' = 'Installed programs'; 'bits' = 'BITS jobs'
+}
+$DcDiffItems = [ordered]@{
+    'ad_privgroups' = 'Privileged domain groups'; 'ad_users' = 'Domain users'; 'ad_spn' = 'SPN accounts (Kerberoast targets)'
+    'ad_asrep' = 'AS-REP accounts (no pre-auth)'; 'ad_delegation' = 'Delegation'; 'ad_adminsdholder' = 'AdminSDHolder permissions'
+    'ad_replrights' = 'Replication rights (DCSync)'; 'ad_gpos' = 'Group Policy objects'; 'ad_krbtgt' = 'krbtgt password'
+    'ad_risky' = 'Risky account settings'; 'ad_trusts' = 'Domain trusts'
+}
+
+function Read-Lines {
+    param([string]$File)
+    if (-not (Test-Path $File)) { return $null }
+    $l = @(Get-Content $File | Where-Object { $_ -ne '' })
+    return ,$l     # the comma keeps an empty file as an empty list instead of nothing
+}
+
+function Compare-Lines {
+    param($Old, $New)
+    $o = @{}; foreach ($l in $Old) { $o[$l] = 1 }
+    $n = @{}; foreach ($l in $New) { $n[$l] = 1 }
+    return @{
+        New  = @($New | Where-Object { -not $o.ContainsKey($_) } | Select-Object -Unique)
+        Gone = @($Old | Where-Object { -not $n.ContainsKey($_) } | Select-Object -Unique)
+    }
+}
+
+function Get-PrevDir {
+    $d = @(Get-ChildItem -Path $Vault -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' -and $_.Name -ne $script:stamp } | Sort-Object Name -Descending | Select-Object -First 1)
+    if ($d.Count -gt 0) { return $d[0].FullName }
+    return $null
+}
+
+function Get-DirTime {
+    param([string]$Dir)
+    $n = Split-Path $Dir -Leaf
+    if ($n -match '^\d{8}-\d{6}$') { return [datetime]::ParseExact($n, 'yyyyMMdd-HHmmss', $null) }
+    return (Get-Item $Dir).CreationTime
+}
+
+# ---------------------------------------------------------------------------
+# team notes
+# ---------------------------------------------------------------------------
+function Add-Note {
+    param([string]$T, [string]$Who)
+    if (-not $Who) { $Who = $env:USERNAME }
+    $line = (UtcNow) + '  ' + $env:COMPUTERNAME + '  ' + $Who + ': ' + $T
+    Add-Content -Path $NotesFile -Value $line
+    return $line
+}
+function Auto-Note { param([string]$T) [void](Add-Note $T 'first30') }
+
+# ---------------------------------------------------------------------------
+# the checks. Each one prints its own section. They run at every hunt and in
+# recon, and do not rely on the baseline: something planted BEFORE the baseline
+# is part of it, and a baseline diff would never flag it. All read only.
+# ---------------------------------------------------------------------------
+function Check-Self {
+    Sec 'self' 'Self-check: can this box fool this script? (T1546.013, T1574)'
+    $bad = $false
+    $hj = @(Test-Hijack)
+    if ($hj.Count -gt 0) {
+        Warn 'These commands are NOT the real Windows ones in this PowerShell window:'
+        $hj | ForEach-Object { Say ('    ' + $_) }
+        Say  ('  Results can be faked. Close this window and start again with: powershell -NoProfile -ExecutionPolicy Bypass -File .\first30.ps1')
+        $bad = $true
+    }
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        Warn 'This is 32-bit PowerShell: Windows shows it a different System32, so results are wrong.'
+        Say  '  Use C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe instead.'
+        $bad = $true
+    }
+    $vi = Get-Item -LiteralPath $Vault -Force
+    if ($vi -and ($vi.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Warn ($Vault + ' is a link to somewhere else. Someone set a trap: use -Vault with another folder.')
+        $bad = $true
+    }
+    $other = @((Get-Acl $Vault).Access | Where-Object { [string]$_.IdentityReference -notmatch '(Administrators|SYSTEM)$' })
+    if ($other.Count -gt 0) {
+        Warn ('Someone else has rights on the vault: ' + (($other | ForEach-Object { [string]$_.IdentityReference }) -join ', '))
+        $bad = $true
+    }
+    if ($bad) { Flag; Nxt 'tell your lead. What this script shows below may be faked.' }
+    else { Good 'the commands this script uses are the real Windows ones, and only Administrators and SYSTEM can open the vault' }
+}
+
+$RatNames = 'meshagent', 'meshcentral', 'mesh agent', 'anydesk', 'teamviewer', 'rustdesk', 'screenconnect', 'connectwise', 'atera', 'splashtop',
+            'logmein', 'gotomypc', 'ammyy', 'remoteutilities', 'dwagent', 'supremo', 'netsupport', 'tightvnc', 'ultravnc', 'realvnc',
+            'winvnc', 'tvnserver', 'ngrok', 'chisel', 'frpc', 'plink', 'psexesvc', 'imix', 'sliver', 'ligolo'
+$RatPorts = 16990, 16991, 7070, 5938, 6568, 8041, 5900, 4899, 8040
+
+function Check-RAT {
+    Sec 'rat' 'Remote-access tools (T1219: the MeshCentral agent was the way in at the invitational)'
+    $svc  = @(Get-CimInstance Win32_Service)
+    $proc = @(Get-CimInstance Win32_Process)
+    $sw   = @((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*').DisplayName)
+    $tsk  = @(Get-ScheduledTask | ForEach-Object { $_.TaskName + ' ' + (($_.Actions | ForEach-Object { [string]$_.Execute + ' ' + [string]$_.Arguments }) -join ' ') })
+    $hits = @()
+    foreach ($n in $RatNames) {
+        $rx = '(?i)(^|[^a-z])' + [regex]::Escape($n)
+        foreach ($x in @($svc | Where-Object { $_.Name -match $rx -or $_.DisplayName -match $rx -or $_.PathName -match $rx })) { $hits += ('service: ' + $x.Name + '  ->  ' + $x.PathName) }
+        foreach ($x in @($proc | Where-Object { $_.Name -match $rx -or $_.ExecutablePath -match $rx })) { $hits += ('process: ' + $x.Name + ' (pid ' + $x.ProcessId + ')  ' + $x.ExecutablePath) }
+        foreach ($x in @($sw | Where-Object { $_ -match $rx })) { $hits += ('installed: ' + $x) }
+        foreach ($x in @($tsk | Where-Object { $_ -match $rx })) { $hits += ('scheduled task: ' + $x) }
+    }
+    foreach ($x in @(Get-NetTCPConnection -State Listen | Where-Object { $RatPorts -contains $_.LocalPort })) { $hits += ('listening on a known remote-access port ' + $x.LocalPort + ' (pid ' + $x.OwningProcess + ')') }
+    if ($hits.Count -gt 0) {
+        Warn ('possible remote-access tools (' + $hits.Count + '):')
+        $hits | Sort-Object -Unique | ForEach-Object { Say ('    * ' + $_) }
+        Flag
+        Nxt 'ask your team if anyone installed it. If not: save evidence (menu 5), then with your lead stop and disable it.'
+        Say '        Red team installed MeshCentral the day BEFORE the invitational.'
+    } else {
+        Good 'none found by name, service, task or port'
+    }
+}
+
+# connections this box opened to somewhere else
+function Get-OutboundConn {
+    param([string[]]$States = @('Established', 'SynSent'))
+    $listen = @(Get-NetTCPConnection -State Listen | Select-Object -ExpandProperty LocalPort -Unique)
+    foreach ($c in @(Get-NetTCPConnection -State $States)) {
+        $ra = ([string]$c.RemoteAddress) -replace '^::ffff:', ''
+        if ($ra -match '^(127\.|0\.0\.0\.0$|::1$|::$)') { continue }
+        if ($listen -contains $c.LocalPort) { continue }      # an answer from one of our own services
+        [pscustomobject]@{ Remote = $ra; Port = $c.RemotePort; LPort = $c.LocalPort; State = [string]$c.State; Owner = [int]$c.OwningProcess }
+    }
+}
+
+function Get-C2Rows {
+    $blocked = @(Get-BlockList)
+    $procs = @{}
+    foreach ($p in @(Get-CimInstance Win32_Process)) { $procs[[int]$p.ProcessId] = $p }
+    foreach ($g in @(Get-OutboundConn | Group-Object Remote, Port, Owner, State)) {
+        $c = $g.Group[0]
+        $p = $procs[$c.Owner]
+        $exe = ''
+        if ($p) { $exe = [string]$p.ExecutablePath }
+        $why = @()
+        if ($blocked | Where-Object { Test-InNet $c.Remote $_ }) { $why += 'blocked-address' }
+        if (Test-Outside $c.Remote) { $why += 'outside-our-networks' }
+        if ($c.State -eq 'SynSent') { $why += 'still-trying-to-connect' }
+        if ($exe -and (Test-UserWritable $exe)) { $why += 'user-or-temp-folder' }
+        if ($exe -and (Get-SigStatus $exe) -ne 'Valid') { $why += 'not-signed' }
+        $name = '?'
+        if ($p) { $name = $p.Name }
+        $to = $c.Remote + ':' + $c.Port
+        if ($g.Count -gt 1) { $to = $to + ' (x' + $g.Count + ')' }
+        [pscustomobject]@{ Program = $name; PID = $c.Owner; To = $to; Marked = ($why -join ' '); Path = $exe }
+    }
+}
+
+function Check-C2 {
+    Sec 'c2' 'Connections out of this box right now (T1071; for a 30-second watch use menu 3 or: first30.ps1 c2)'
+    $rows = @(Get-C2Rows)
+    if ($rows.Count -eq 0) { Good 'no connections out of this box right now'; return }
+    Show ($rows | Sort-Object Marked -Descending)
+    if ($rows | Where-Object { $_.Marked -match 'outside|blocked|user-or-temp|not-signed' }) {
+        Flag
+        Nxt 'write down the program, address and time. Save the program (evidence), then block the address (menu 8).'
+    }
+}
+
+function Check-Programs {
+    Sec 'progs' 'Running programs that are not signed, or run from a user or temp folder (T1036, T1204)'
+    $rows = @()
+    foreach ($g in @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath } | Group-Object ExecutablePath)) {
+        $exe = $g.Name
+        $why = @()
+        if (Test-UserWritable $exe) { $why += 'user-or-temp-folder' }
+        if ($why.Count -gt 0 -or -not ($exe.ToLower().StartsWith(($env:windir).ToLower() + '\'))) {
+            $s = Get-SigStatus $exe
+            if ($s -ne 'Valid') { $why += ('signature:' + $s) }
+        }
+        if ($why.Count -gt 0) {
+            $rows += [pscustomobject]@{ Program = $exe; Running = $g.Count; PIDs = (($g.Group | Select-Object -First 3 | ForEach-Object { $_.ProcessId }) -join ','); Why = ($why -join ' ') }
+        }
+    }
+    if ($rows.Count -gt 0) {
+        Show $rows
+        Say '  Some are real programs a person installed. Check each one: what is it, and who put it there?'
+        Flag
+        Nxt 'for one nobody knows: save evidence (menu 5), then ask your lead before stopping it.'
+    } else {
+        Good 'every running program outside C:\Windows is signed, and none runs from a user or temp folder'
+    }
+}
+
+function Check-CmdLines {
+    Sec 'cmdline' 'Suspicious command lines, and shells started by servers (T1059.001, T1218, T1505.003)'
+    $lol = '(?i)(\s-e(nc(odedcommand)?)?\s+[a-z0-9+/=]{20,}|frombase64string|downloadstring|downloadfile|invoke-expression|\biex\b|invoke-webrequest|\biwr\s|net\.webclient|start-bitstransfer|certutil(\.exe)?\s.*-urlcache|bitsadmin(\.exe)?\s.*/transfer|mshta(\.exe)?\s+(http|javascript|vbscript)|regsvr32(\.exe)?\s.*/i:\s*http|rundll32(\.exe)?\s.*(javascript:|http)|wmic(\.exe)?\s.*process\s+call\s+create|-w(indowstyle)?\s+h(idden)?\b)'
+    $shells  = 'cmd.exe', 'powershell.exe', 'pwsh.exe', 'whoami.exe', 'net.exe', 'net1.exe', 'nltest.exe', 'certutil.exe', 'bitsadmin.exe', 'mshta.exe', 'rundll32.exe', 'regsvr32.exe', 'wscript.exe', 'cscript.exe', 'bash.exe'
+    $servers = 'w3wp.exe', 'sqlservr.exe', 'httpd.exe', 'nginx.exe', 'php-cgi.exe', 'tomcat.exe', 'tomcat9.exe', 'java.exe', 'wmiprvse.exe', 'winrshost.exe', 'services.exe', 'spoolsv.exe', 'mshta.exe'
+    $procs = @(Get-CimInstance Win32_Process)
+    $byId = @{}
+    foreach ($p in $procs) { $byId[[int]$p.ProcessId] = $p }
+    $out = @()
+    foreach ($p in $procs) {
+        if ([int]$p.ProcessId -eq $PID) { continue }
+        $cl = [string]$p.CommandLine
+        if ($cl -match $lol) { $out += ('  pid ' + $p.ProcessId + ' ' + $p.Name + ': ' + $cl) }
+        $par = $byId[[int]$p.ParentProcessId]
+        if ($par -and ($shells -contains $p.Name.ToLower()) -and ($servers -contains $par.Name.ToLower())) {
+            $out += ('  pid ' + $p.ProcessId + ' ' + $p.Name + ' was started by ' + $par.Name + ' (pid ' + $par.ProcessId + '): ' + $cl)
+        }
+    }
+    if ($out.Count -gt 0) {
+        Warn 'check these:'
+        $out | Select-Object -Unique | ForEach-Object { Say $_ }
+        Say '  A shell started by the web server, SQL server, WMI or services.exe is how remote commands run (webshell, wmiexec, psexec).'
+        Flag
+        Nxt 'note the pid, its parent and the time. Save the program (evidence), then stop it with your lead.'
+    } else {
+        Good 'no encoded or download-style command lines, and no server starting a shell right now'
+    }
+}
+
+function Check-Services {
+    Sec 'svc' 'Services from odd places, unsigned, or hidden from the services list (T1543.003, T1564)'
+    $out = @()
+    foreach ($s in @(Get-CimInstance Win32_Service | Where-Object { $_.PathName })) {
+        $exe = Get-ExeFromCmd $s.PathName
+        $why = @()
+        if (Test-UserWritable $exe) { $why += 'user-or-temp-folder' }
+        if ($exe -and -not $exe.ToLower().StartsWith(($env:windir).ToLower() + '\')) {
+            $sg = Get-SigStatus $exe
+            if ($sg -ne 'Valid') { $why += ('signature:' + $sg) }
+        }
+        # svchost services load a DLL; a DLL outside System32 is a planted one
+        if ($exe -match '(?i)\\svchost\.exe$') {
+            $dll = (Get-ItemProperty ('HKLM:\SYSTEM\CurrentControlSet\Services\' + $s.Name + '\Parameters')).ServiceDll
+            if ($dll) {
+                $dll = [Environment]::ExpandEnvironmentVariables($dll)
+                if ($dll -notmatch '(?i)^[a-z]:\\windows\\(system32|syswow64)\\') { $why += ('ServiceDll:' + $dll) }
+            }
+        }
+        if ($why.Count -gt 0) { $out += ('  ' + $s.Name + ' (' + $s.State + ', ' + $s.StartMode + ') -> ' + $s.PathName + '   [' + ($why -join ' ') + ']') }
+    }
+    # hidden services: in the registry, but missing from the services list. A
+    # service whose permissions deny reading hides from services.msc and Get-Service.
+    $scm = @{}
+    foreach ($s in @(Get-Service)) { $scm[$s.Name.ToLower()] = 1 }
+    foreach ($k in @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services')) {
+        $p = Get-ItemProperty $k.PSPath
+        if (($p.Type -eq 16 -or $p.Type -eq 32) -and $p.ImagePath -and -not $scm.ContainsKey($k.PSChildName.ToLower())) {
+            $out += ('  HIDDEN service: ' + $k.PSChildName + ' -> ' + $p.ImagePath + '   (in the registry, not in the services list)')
+        }
+    }
+    if ($out.Count -gt 0) {
+        Warn 'check these services:'
+        $out | ForEach-Object { Say $_ }
+        Flag
+        Nxt 'sc.exe qc <name> shows it. sc.exe sdshow <name> shows its permissions. Save the program (evidence) before you stop it.'
+    } else {
+        Good 'every service runs a signed program from a normal folder, and none is hidden'
+    }
+}
+
+function Check-Drivers {
+    Sec 'drivers' 'Kernel drivers that are not signed or not in the drivers folder (T1014, T1543.003)'
+    $out = @()
+    foreach ($d in @(Get-CimInstance Win32_SystemDriver | Where-Object { $_.State -eq 'Running' })) {
+        $f = Get-ExeFromCmd $d.PathName
+        if (-not $f) { continue }
+        $why = @()
+        if ($f -notmatch '(?i)^[a-z]:\\windows\\system32\\') { $why += 'outside System32' }
+        $sg = Get-SigStatus $f
+        if ($sg -ne 'Valid') { $why += ('signature:' + $sg) }
+        if ($why.Count -gt 0) { $out += ('  ' + $d.Name + ' -> ' + $f + '   [' + ($why -join ', ') + ']') }
+    }
+    if ($out.Count -gt 0) {
+        Warn 'check these drivers:'
+        $out | ForEach-Object { Say $_ }
+        Say '  (VirtualBox, VMware or Hyper-V guest drivers are signed; an unsigned driver is the warning sign.)'
+        Flag
+        Nxt 'tell your lead. A bad driver means the box cannot be trusted: plan to restore it.'
+    } else {
+        Good 'every running driver is signed and lives in System32'
+    }
+}
+
+function Check-Tasks {
+    Sec 'tasks' 'Scheduled tasks that download, decode, or run from user or temp folders (T1053.005)'
+    $out = @()
+    foreach ($t in @(Get-ScheduledTask)) {
+        foreach ($a in @($t.Actions)) {
+            $line = ([string]$a.Execute + ' ' + [string]$a.Arguments).Trim()
+            if (-not $line) { continue }
+            $why = @()
+            if ($line -match '(?i)-enc|-EncodedCommand|FromBase64|DownloadString|DownloadFile|\bIEX\b|Invoke-Expression|Invoke-WebRequest|certutil|bitsadmin|mshta|regsvr32\s+/s\s+/i|http[s]?://') { $why += 'download-or-encoded' }
+            $exe = Get-ExeFromCmd ([string]$a.Execute)
+            if ($exe -and (Test-UserWritable $exe)) { $why += 'user-or-temp-folder' }
+            if ($why.Count -gt 0) { $out += ('  ' + $t.TaskPath + $t.TaskName + ' (' + $t.State + '): ' + $line + '   [' + ($why -join ' ') + ']') }
+        }
+    }
+    if ($out.Count -gt 0) {
+        Warn 'check these tasks:'
+        $out | ForEach-Object { Say $_ }
+        Flag
+        Nxt 'Task Scheduler > find the task > Actions tab. If nobody on your team made it: export it for evidence, then disable it.'
+    } else {
+        Good 'no task downloads, decodes, or runs from a user or temp folder'
+    }
+}
+
+function Check-Persist {
+    Sec 'persist' 'Logon-screen backdoors, password stealers and other auto-start spots (T1546, T1547, T1556.002)'
+    $out = @()
+    # accessibility programs swapped for cmd or anything else: the file's own name inside must match
+    $cmdHash = (Get-FileHash "$env:windir\System32\cmd.exe" -Algorithm SHA256).Hash
+    $psHash  = (Get-FileHash "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" -Algorithm SHA256).Hash
+    foreach ($f in 'sethc.exe', 'utilman.exe', 'osk.exe', 'Magnify.exe', 'Narrator.exe', 'DisplaySwitch.exe', 'AtBroker.exe') {
+        $fp = Join-Path "$env:windir\System32" $f
+        if (-not (Test-Path $fp)) { continue }
+        $h = (Get-FileHash $fp -Algorithm SHA256).Hash
+        $orig = ([string](Get-Item $fp).VersionInfo.OriginalFilename) -replace '(?i)\.mui$', ''
+        if ($h -eq $cmdHash -or $h -eq $psHash) { $out += ('  ' + $f + ' is a copy of cmd.exe or powershell.exe (logon-screen backdoor, T1546.008)') }
+        elseif ($orig -and $orig -ne $f) { $out += ('  ' + $f + ' is really "' + $orig + '" inside (a swapped program, T1546.008)') }
+    }
+    $ifeo = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+    Get-ChildItem $ifeo | ForEach-Object {
+        $p = Get-ItemProperty $_.PSPath
+        if ($p.Debugger) { $out += ('  IFEO debugger on ' + $_.PSChildName + ' -> ' + $p.Debugger + '   (T1546.012)') }
+    }
+    Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit' | ForEach-Object {
+        $p = Get-ItemProperty $_.PSPath
+        if ($p.MonitorProcess) { $out += ('  when ' + $_.PSChildName + ' exits, Windows runs ' + $p.MonitorProcess + '   (T1546.012)') }
+    }
+    $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    if ($wl.Shell -and $wl.Shell -ne 'explorer.exe') { $out += ('  Winlogon Shell is "' + $wl.Shell + '" (normal: explorer.exe; Server Core can differ)') }
+    if ($wl.Userinit -and ($wl.Userinit.Trim().TrimEnd(',') -notmatch '^(?i)(C:\\Windows\\system32\\)?userinit\.exe$')) { $out += ('  Winlogon Userinit is "' + $wl.Userinit + '" (normal: C:\Windows\system32\userinit.exe,)') }
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows') {
+        $ai = Get-ItemProperty $k
+        if ($ai.AppInit_DLLs) { $out += ('  AppInit_DLLs: ' + $ai.AppInit_DLLs + ' (loads into almost every program, T1546.010)') }
+    }
+    $ac = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls'
+    if ($ac) { $ac.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object { $out += ('  AppCertDlls: ' + $_.Value + ' (T1546.009)') } }
+    $be = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager').BootExecute
+    foreach ($b in @($be)) { if ($b -and $b -notmatch '^(?i)autocheck autochk \*$') { $out += ('  BootExecute runs: ' + $b + ' (before Windows starts)') } }
+    # LSA: password filters see every new password, security packages see logons
+    $lsa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+    $okSec = '', 'kerberos', 'msv1_0', 'schannel', 'wdigest', 'tspkg', 'pku2u', 'cloudap', 'livessp', 'negoexts', '"', '""'
+    $sp = @($lsa.'Security Packages') + @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\OSConfig').'Security Packages')
+    foreach ($v in $sp) { if ($v -and ($okSec -notcontains $v.ToLower())) { $out += ('  LSA security package "' + $v + '" is not a Windows one (mimilib-style logon stealer, T1547.005)') } }
+    foreach ($v in @($lsa.'Authentication Packages')) { if ($v -and $v.ToLower() -ne 'msv1_0') { $out += ('  LSA authentication package "' + $v + '" (normal: msv1_0, T1547.002)') } }
+    foreach ($v in @($lsa.'Notification Packages')) { if ($v -and ('scecli', 'rassfm', 'fpnwclnt', 'kdcsvc', 'passfilt' -notcontains $v.ToLower())) { $out += ('  password filter "' + $v + '": it sees every new password you set (T1556.002)') } }
+    if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest').UseLogonCredential -eq 1) { $out += '  WDigest UseLogonCredential = 1: Windows keeps plain-text passwords in memory (T1112)' }
+    if ($MyRole -eq 'dc' -and $lsa.DsrmAdminLogonBehavior -eq 2) { $out += '  DsrmAdminLogonBehavior = 2: the DSRM password logs in over the network (the backdoor from your AD session)' }
+    # netsh helpers, print monitors and time providers load DLLs into system processes
+    $ns = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NetSh'
+    if ($ns) { $ns.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object {
+        $v = [string]$_.Value
+        if ($v -match '\\' -or -not (Test-Path (Join-Path "$env:windir\System32" $v))) { $out += ('  netsh helper ' + $_.Name + ' = ' + $v + ' (T1546.007)') } } }
+    Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors' | ForEach-Object {
+        $d = [string](Get-ItemProperty $_.PSPath).Driver
+        if ($d -and ($d -match '\\' -or -not (Test-Path (Join-Path "$env:windir\System32" $d)))) { $out += ('  print monitor ' + $_.PSChildName + ' = ' + $d + ' (T1547.010)') } }
+    Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders' | ForEach-Object {
+        $d = [Environment]::ExpandEnvironmentVariables([string](Get-ItemProperty $_.PSPath).DllName)
+        if ($d -and $d -notmatch '(?i)\\system32\\(w32time|vmictimeprovider)\.dll$') { $out += ('  time provider ' + $_.PSChildName + ' = ' + $d + ' (T1547.003)') } }
+    if ($out.Count -gt 0) {
+        Warn 'check these:'
+        $out | ForEach-Object { Say $_ }
+        Flag
+        Nxt 'export the registry key for evidence (reg export), then remove the value with your lead. Some need a reboot to unload.'
+    } else {
+        Good 'accessibility programs, IFEO, Winlogon, AppInit, LSA, WDigest, netsh, print monitors and time providers all look normal'
+    }
+    $sf = @(Get-Autoruns | Where-Object { $_ -like 'Startup folder | *' })
+    if ($sf.Count -gt 0) { Say '  Files in Startup folders (they run at logon):'; $sf | ForEach-Object { Say ('    ' + ($_ -replace '^Startup folder \| ', '')) } }
+}
+
+function Check-Wmi {
+    Sec 'wmi' 'WMI subscriptions that run commands (T1546.003)'
+    $c = @(Get-CimInstance -Namespace root\subscription -ClassName __EventConsumer | Where-Object {
+        $_.CimClass.CimClassName -match 'CommandLineEventConsumer|ActiveScriptEventConsumer' -and $_.Name -ne 'BVTConsumer' })
+    if ($c.Count -gt 0) {
+        Warn 'WMI consumers that run a command or a script:'
+        foreach ($x in $c) {
+            $what = $x.CommandLineTemplate
+            if (-not $what) { $what = $x.ScriptText }
+            if (-not $what) { $what = $x.ScriptFileName }
+            Say ('    ' + $x.Name + ' (' + $x.CimClass.CimClassName + '): ' + $what)
+        }
+        Flag
+        Nxt 'Windows has none of these by default. Save the output for evidence, then remove the consumer, its filter and binding with your lead.'
+    } else {
+        Good 'no WMI subscription runs a command or a script'
+    }
+}
+
+function Check-Profiles {
+    Sec 'profiles' 'PowerShell profiles (T1546.013: code that runs every time PowerShell starts)'
+    $prof = @("$env:windir\System32\WindowsPowerShell\v1.0\profile.ps1",
+              "$env:windir\System32\WindowsPowerShell\v1.0\Microsoft.PowerShell_profile.ps1",
+              "$env:windir\SysWOW64\WindowsPowerShell\v1.0\profile.ps1",
+              "$env:windir\SysWOW64\WindowsPowerShell\v1.0\Microsoft.PowerShell_profile.ps1",
+              "$env:ProgramFiles\PowerShell\7\profile.ps1")
+    $prof += @(Get-ChildItem 'C:\Users\*\Documents\WindowsPowerShell\*profile.ps1', 'C:\Users\*\Documents\PowerShell\*profile.ps1' -Force | Select-Object -ExpandProperty FullName)
+    $found = @($prof | Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique)
+    if ($found.Count -gt 0) {
+        Warn 'PowerShell profile files exist. Read each one: a planted profile can run code or fake commands.'
+        $found | ForEach-Object { Say ('    * ' + $_ + '   (changed ' + (Get-Item $_ -Force).LastWriteTime + ')') }
+        Flag
+        Nxt 'open each in Notepad. If your team did not write it: copy it for evidence, then delete it.'
+    } else {
+        Good 'no PowerShell profile files'
+    }
+}
+
+function Check-Defender {
+    param([datetime]$Since)
+    Sec 'defender' 'Defender: on, no exclusions, and what it caught (T1562.001)'
+    $bad = $false
+    $st = Get-MpComputerStatus
+    if ($st) {
+        if ($st.RealTimeProtectionEnabled) { Good 'real-time protection is on' } else { Warn 'real-time protection is OFF'; $bad = $true }
+        if (-not $st.AntivirusEnabled) { Warn 'the antivirus engine is OFF'; $bad = $true }
+    } else {
+        Say '  Defender status is not available on this box'
+    }
+    $mp = Get-MpPreference
+    $ex = @(@($mp.ExclusionPath) + @($mp.ExclusionProcess) + @($mp.ExclusionExtension) + @($mp.ExclusionIpAddress) | Where-Object { $_ })
+    if ($ex.Count -gt 0) {
+        Warn 'Defender exclusions (Defender never scans these):'
+        $ex | ForEach-Object { Say ('    * ' + $_) }
+        $bad = $true
+    }
+    $det = @(Get-MpThreatDetection | Where-Object { $_.InitialDetectionTime -gt $Since })
+    if ($det.Count -gt 0) {
+        $names = @{}
+        foreach ($t in @(Get-MpThreat)) { $names[[string]$t.ThreatID] = $t.ThreatName }
+        Warn ('Defender caught something since ' + $Since.ToString('HH:mm') + ':')
+        foreach ($d in $det) { Say ('    ' + $d.InitialDetectionTime.ToString('HH:mm') + '  ' + $names[[string]$d.ThreatID] + '  ' + (@($d.Resources) -join '; ')) }
+        $bad = $true
+    }
+    if ($bad) { Flag; Nxt 'turn protection back on, remove exclusions your team did not add, and look at every file Defender named.' }
+}
+
+function Check-Firewall {
+    Sec 'firewall' 'Firewall (T1562.004: at the invitational the Windows firewall was turned off, and block rules broke scored services)'
+    $bad = $false
+    $off = @(Get-NetFirewallProfile | Where-Object { $_.Enabled -eq 'False' } | Select-Object -ExpandProperty Name)
+    if ($off.Count -gt 0) { Warn ('the firewall is OFF for: ' + ($off -join ', ')); $bad = $true } else { Good 'the firewall is on for every profile' }
+    $gpo = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Where-Object { [string]$_.AllowLocalFirewallRules -eq 'False' } | Select-Object -ExpandProperty Name)
+    if ($gpo.Count -gt 0) {
+        Warn ('a Group Policy ignores rules made on this box for: ' + ($gpo -join ', ') + '. Block rules from this script will NOT work there.')
+        $bad = $true
+    }
+    foreach ($s in 'mpssvc', 'BFE') {
+        $x = Get-Service $s
+        if ($x -and $x.Status -ne 'Running') { Warn ('the ' + $x.DisplayName + ' service is ' + $x.Status + ': the firewall cannot work'); $bad = $true }
+    }
+    $blk = @(Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True | Where-Object { $_.DisplayName -notlike 'first30 block *' })
+    if ($blk.Count -gt 0) {
+        Warn 'inbound BLOCK rules (one of these can take a scored service down; check each one):'
+        $blk | ForEach-Object { Say ('    * ' + $_.DisplayName) }
+        $bad = $true
+    }
+    if ($bad) { Flag; Nxt 'tell your lead before turning the firewall on: it can also block scored services.' }
+}
+
+# Two ways of listing the same thing should agree. A rootkit usually fools one.
+function Check-Rootkit {
+    Sec 'rootkit' 'Rootkit checks: things hidden from normal tools (T1014, T1564)'
+    $out = @()
+    $a = @(Get-Process | ForEach-Object { [int]$_.Id })
+    $b = @(Get-CimInstance Win32_Process | ForEach-Object { [int]$_.ProcessId })
+    $cand = @($a | Where-Object { $b -notcontains $_ }) + @($b | Where-Object { $a -notcontains $_ })
+    if ($cand.Count -gt 0) {
+        Start-Sleep -Seconds 1
+        foreach ($x in ($cand | Select-Object -Unique)) {
+            $inA = [bool](Get-Process -Id $x -ErrorAction SilentlyContinue)
+            $inB = [bool](Get-CimInstance Win32_Process -Filter ('ProcessId=' + $x))
+            if ($inA -ne $inB) { $out += ('  process ' + $x + ' shows in only one of Get-Process and WMI') }
+        }
+    }
+    $p1 = @(Get-NetTCPConnection -State Listen | ForEach-Object { [int]$_.LocalPort } | Sort-Object -Unique)
+    $p2 = @(netstat -ano -p TCP | Select-String 'LISTENING' | ForEach-Object { [int](((($_.Line.Trim()) -split '\s+')[1]) -replace '.*:', '') })
+    $p2 += @(netstat -ano -p TCPv6 | Select-String 'LISTENING' | ForEach-Object { [int](((($_.Line.Trim()) -split '\s+')[1]) -replace '.*:', '') })
+    $p2 = @($p2 | Sort-Object -Unique)
+    $d1 = @($p1 | Where-Object { $p2 -notcontains $_ })
+    $d2 = @($p2 | Where-Object { $p1 -notcontains $_ })
+    if ($d1.Count -gt 0 -or $d2.Count -gt 0) {
+        Start-Sleep -Seconds 1
+        $q1 = @(Get-NetTCPConnection -State Listen | ForEach-Object { [int]$_.LocalPort })
+        $q2 = @(netstat -ano | Select-String 'LISTENING' | ForEach-Object { [int](((($_.Line.Trim()) -split '\s+')[1]) -replace '.*:', '') })
+        foreach ($x in $d1) { if ($q2 -notcontains $x -and $q1 -contains $x) { $out += ('  port ' + $x + ' is listening, but netstat does not show it') } }
+        foreach ($x in $d2) { if ($q1 -notcontains $x -and $q2 -contains $x) { $out += ('  port ' + $x + ' shows in netstat, but not in Get-NetTCPConnection') } }
+    }
+    if ($out.Count -gt 0) {
+        Warn 'the two views disagree:'
+        $out | ForEach-Object { Say $_ }
+        Flag
+        Nxt 'tell your lead NOW. Something is hiding: the box cannot be trusted. Plan to restore it.'
+    } else {
+        Good 'processes and listening ports look the same both ways (hidden services are checked under Services)'
+    }
+}
+
+function Check-Accounts {
+    Sec 'accounts' 'Accounts: Guest, no password needed, the built-in Administrator (T1078.001, T1098)'
+    $out = @()
+    foreach ($u in @(Get-LocalUser)) {
+        if ($u.SID.Value -like '*-501' -and $u.Enabled) { $out += ('  the Guest account (' + $u.Name + ') is ENABLED') }
+        if ($u.SID.Value -like '*-503' -and $u.Enabled) { $out += ('  DefaultAccount (' + $u.Name + ') is ENABLED') }
+        if ($u.Enabled -and -not $u.PasswordRequired) { $out += ('  ' + $u.Name + ' can have an EMPTY password (PasswordRequired = False)') }
+    }
+    if ($out.Count -gt 0) {
+        Warn 'check these accounts:'
+        $out | ForEach-Object { Say $_ }
+        Flag
+        Nxt 'ask your lead. Disable an account nobody needs (lusrmgr.msc > right-click > Properties > Account is disabled).'
+    } else {
+        Good 'Guest and DefaultAccount are off, and every enabled account needs a password'
+    }
+    Get-LocalUser | Where-Object { $_.SID.Value -like '*-500' } | ForEach-Object { Say ('  built-in Administrator (RID 500): ' + $_.Name + '   enabled=' + $_.Enabled) }
+    $la = @(Get-LocalAdmins)
+    if ($la.Count -gt 0) { Say ('  Administrators group: ' + (($la | ForEach-Object { ($_ -split ' \| ')[0] }) -join ', ')) }
+}
+
+function Check-Logins {
+    Sec 'logins' 'Who is logged in now, and from where (T1078, T1021.001, T1021.002)'
+    $bad = $false
+    $q = @(quser 2>$null)
+    if ($q.Count -gt 0) { Say '  sessions on this box (quser):'; $q | ForEach-Object { Say ('    ' + $_) } }
+    $rdp = @(Get-NetTCPConnection -LocalPort 3389 -State Established | ForEach-Object { ([string]$_.RemoteAddress) -replace '^::ffff:', '' } | Sort-Object -Unique)
+    foreach ($r in $rdp) {
+        $m = ''
+        if (Test-Outside $r) { $m = '   <- from outside your networks'; $bad = $true }
+        Say ('  RDP connection from ' + $r + $m)
+    }
+    $smb = @(Get-SmbSession)
+    foreach ($s in $smb) {
+        $m = ''
+        if (Test-Outside $s.ClientComputerName) { $m = '   <- from outside your networks'; $bad = $true }
+        Say ('  share session: ' + $s.ClientUserName + ' from ' + $s.ClientComputerName + ' (' + $s.NumOpens + ' files open)' + $m)
+    }
+    if ($q.Count -eq 0 -and $rdp.Count -eq 0 -and $smb.Count -eq 0) { Say '  nobody else is connected right now' }
+    if ($script:Nets.Count -eq 0) { Say '  Tip: save your networks so outside addresses get marked (menu N, or: first30.ps1 nets -OurNets 10.100.130.0/24)' }
+    if ($bad) { Flag; Nxt 'a session you cannot explain: write down the account, address and time, then log it off (Task Manager > Users) and block the address.' }
+}
+
+# Pop-up spam and screen watching. msg.exe sends a pop-up to every session; from
+# another machine it needs AllowRemoteRPC = 1. RDP shadowing lets someone watch (or
+# drive) your RDP session; Shadow = 2 or 4 means without asking you first.
+$TsKey     = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+$TsPolicy  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+function Check-Spam {
+    param([datetime]$Since)
+    Sec 'spam' 'Pop-up spam and screen watching (msg.exe, RDP shadowing; T1021.001, T1563.002, T1113)'
+    $out = @()
+    if ((Get-ItemProperty $TsKey).AllowRemoteRPC -eq 1) { $out += '  AllowRemoteRPC = 1: other machines can send pop-ups here (msg /server), and list or kick sessions' }
+    # the policy wins; without it, RDP uses the setting on the RDP-Tcp listener
+    $sh = (Get-ItemProperty $TsPolicy).Shadow
+    $shw = 'policy'
+    if ($null -eq $sh) { $sh = (Get-ItemProperty ($TsKey + '\WinStations\RDP-Tcp')).Shadow; $shw = 'RDP-Tcp listener' }
+    if ($sh -eq 2) { $out += ('  RDP Shadow = 2 (' + $shw + '): someone can WATCH AND CONTROL your RDP sessions without asking you') }
+    if ($sh -eq 4) { $out += ('  RDP Shadow = 4 (' + $shw + '): someone can WATCH your RDP sessions without asking you') }
+    # RdpSa*.exe run on the box whose session is being shadowed; mstsc /shadow runs on the watcher's box
+    foreach ($x in @(Get-CimInstance Win32_Process)) {
+        $n = [string]$x.Name
+        if ($n -ieq 'msg.exe') { $out += ('  msg.exe is running right now (pid ' + $x.ProcessId + '): ' + $x.CommandLine) }
+        elseif ($n -match '^(?i)RdpSa(Proxy|UacHelper)?\.exe$') { $out += ('  ' + $n + ' is running (pid ' + $x.ProcessId + '): an RDP session on this box is being shadowed right now') }
+        elseif ($n -ieq 'mstsc.exe' -and [string]$x.CommandLine -match '(?i)/shadow') { $out += ('  someone on this box is shadowing another session (pid ' + $x.ProcessId + '): ' + $x.CommandLine) }
+    }
+    foreach ($e in @(Get-Evt 'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational' (XSince @(20503, 20506) $Since) 20)) {
+        $out += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  someone started shadowing an RDP session: watching it, maybe controlling it (event ' + $e.Id + ')')
+    }
+    $undo = Join-Path $Vault 'quiet_undo.txt'
+    if ((Test-Path $undo) -and ((Get-ItemProperty $TsKey).AllowRemoteRPC -ne 0 -or (Get-ItemProperty $TsPolicy).Shadow -ne 0)) {
+        $out += '  your spam protection was turned back off (AllowRemoteRPC or Shadow is no longer 0)'
+    }
+    if ($out.Count -gt 0) {
+        Warn 'check these:'
+        $out | ForEach-Object { Say $_ }
+        Flag
+        Nxt 'run quiet (menu 11). Pop-ups that keep coming are from an admin on this box: find the session with quser, log it off, change that password.'
+    } else {
+        Good 'no pop-up spam from other machines, and nobody can watch your RDP sessions without asking'
+        if (-not (Test-Path $undo)) { Say '  Spam protection is not on. Turn it on: menu 11, or first30.ps1 quiet' }
+    }
+}
+
+function Check-Bits {
+    Sec 'bits' 'BITS jobs: background downloads (T1197)'
+    $j = @(Get-BitsTransfer -AllUsers)
+    $odd = @($j | Where-Object { (@($_.FileList) | Where-Object { $_.RemoteName -and $_.RemoteName -notmatch '(?i)(windowsupdate|microsoft|msftconnecttest|office)\.com' }).Count -gt 0 })
+    if ($odd.Count -gt 0) {
+        Warn 'BITS jobs downloading from somewhere other than Microsoft:'
+        foreach ($x in $odd) { Say ('    ' + $x.DisplayName + ' (' + $x.OwnerAccount + ', ' + $x.JobState + '): ' + ((@($x.FileList) | ForEach-Object { $_.RemoteName + ' -> ' + $_.LocalName }) -join '; ')) }
+        Flag
+        Nxt 'save the list for evidence, then remove the job with your lead: Get-BitsTransfer -AllUsers | Where-Object DisplayName -eq <name> | Remove-BitsTransfer'
+    } else {
+        Good ('no BITS job downloads from outside Microsoft (' + $j.Count + ' jobs in total)')
+    }
+}
+
+function Check-Ads {
+    Sec 'ads' 'Files hidden inside other files (alternate data streams, T1564.004)'
+    $okStreams = ':$DATA', 'Zone.Identifier', 'SmartScreen', 'Afp_AfpInfo', 'com.dropbox.attributes', 'encryptable', 'favicon', 'OECustomProperty'
+    $spots = @('C:\Users\Public', "$env:windir\Temp", 'C:\inetpub\wwwroot', 'C:\PerfLogs')
+    $spots += @(Resolve-Path 'C:\Users\*\AppData\Local\Temp' | ForEach-Object { $_.Path })
+    $out = @()
+    foreach ($s in $spots) {
+        if (-not (Test-Path $s)) { continue }
+        foreach ($f in @(Get-ChildItem -Path $s -File -Force -Recurse -Depth 2 | Select-Object -First 400)) {
+            foreach ($st in @(Get-Item -LiteralPath $f.FullName -Stream * -ErrorAction SilentlyContinue)) {
+                if ($okStreams -notcontains $st.Stream) { $out += ('  ' + $f.FullName + ' : ' + $st.Stream + ' (' + $st.Length + ' bytes)') }
+            }
+        }
+    }
+    if ($out.Count -gt 0) {
+        Warn 'hidden streams:'
+        $out | Select-Object -First 30 | ForEach-Object { Say $_ }
+        Flag
+        Nxt 'read one with: Get-Content <file> -Stream <name>. Save the file for evidence before you remove it.'
+    } else {
+        Good 'no hidden streams in Public, Temp, inetpub or PerfLogs'
+    }
+}
+
+function Check-Web {
+    Sec 'web' 'Web shells (T1505.003: a page that runs commands)'
+    $roots = @('C:\inetpub\wwwroot')
+    $cfg = "$env:windir\System32\inetsrv\config\applicationHost.config"
+    if (Test-Path $cfg) {
+        $roots += @(Select-String -Path $cfg -Pattern 'physicalPath="([^"]+)"' -AllMatches | ForEach-Object { $_.Matches } | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_.Groups[1].Value) })
+    }
+    $roots = @($roots | Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique)
+    if ($roots.Count -eq 0) { Good 'no web root on this box'; return }
+    $rx = '(?i)((eval|execute|executeglobal)\s*\(\s*request|process\.start|processstartinfo|wscript\.shell|shell\.application|cmd\.exe\s*/c|fromBase64String\s*\(\s*request|(eval|assert|system|shell_exec|passthru|proc_open|popen)\s*\(\s*@?\$_(get|post|request|cookie)|runtime\.getruntime\(\)\.exec)'
+    $files = @(Get-ChildItem -Path $roots -File -Recurse -Force -Include *.aspx, *.asp, *.ashx, *.asmx, *.cshtml, *.php, *.jsp, *.jspx, *.config | Where-Object { $_.FullName -ne $script:BaitPath })
+    $hits = @($files | Select-String -Pattern $rx -List | Select-Object -ExpandProperty Path -Unique)
+    if ($hits.Count -gt 0) {
+        Warn 'files with web-shell code (REVIEW, do not delete yet):'
+        $hits | Select-Object -First 30 | ForEach-Object { Say ('    ' + $_ + '   (changed ' + (Get-Item $_).LastWriteTime + ')') }
+        Flag
+        Nxt 'open each in Notepad. If it is a shell: save evidence, remove it, and find how it got there (IIS logs).'
+    } else {
+        Good ('nothing that looks like a web shell in: ' + ($roots -join ', '))
+    }
+}
+
+function Check-Ransom {
+    Sec 'ransom' 'Ransomware signs (T1486) and shadow copies (T1490)'
+    $rans = @(Get-ChildItem -Path 'C:\Users', 'C:\inetpub', 'C:\Shares', 'C:\Data' -Recurse -Depth 3 -File -Force -Include '*.locked', '*.encrypted', '*ransom*', '*decrypt*', '*how_to_recover*' | Select-Object -First 15 -ExpandProperty FullName)
+    if ($rans.Count -gt 0) {
+        Warn 'files that look like ransomware:'
+        $rans | ForEach-Object { Say ('    * ' + $_) }
+        Flag
+        Nxt 'tell your lead NOW and restore from backup.'
+    } else {
+        Good 'no locked files or ransom notes found'
+    }
+    Say ('  shadow copies on this box: ' + @(Get-CimInstance Win32_ShadowCopy).Count + '   (hunt shows it if this number drops)')
+}
+
+function Check-DC {
+    if (-not (Get-Command Search-ADAccount -ErrorAction SilentlyContinue)) { return }
+    Sec 'dc' 'Domain accounts locked out or turned off (T1110, T1531)'
+    $bad = $false
+    $locked = @(Search-ADAccount -LockedOut -UsersOnly | Select-Object -ExpandProperty SamAccountName)
+    if ($locked.Count -gt 0) {
+        Warn ('locked out right now (' + $locked.Count + '): ' + ($locked -join ', '))
+        Say  '    Many at once means password guessing, or red team locking scored users on purpose.'
+        $bad = $true
+    } else { Good 'no locked-out users' }
+    $adm = Get-ADUser -Identity ((Get-ADDomain).DomainSID.Value + '-500')
+    if ($adm -and -not $adm.Enabled) {
+        Warn ('the built-in domain Administrator (' + $adm.SamAccountName + ') is DISABLED. Red team did this at the invitational (T1531).')
+        $bad = $true
+    }
+    $dis = @(Search-ADAccount -AccountDisabled -UsersOnly | Where-Object { $_.SamAccountName -notmatch '^(krbtgt|Guest|DefaultAccount)$' } | Select-Object -ExpandProperty SamAccountName)
+    if ($dis.Count -gt 0) { Say ('  turned off (' + $dis.Count + '): ' + (($dis | Select-Object -First 25) -join ', ')) }
+    $risky = @(Read-Lines (Join-Path $script:SnapDir 'ad_risky.txt') | Where-Object { $_ })
+    if ($risky.Count -gt 0) { Warn 'risky account settings:'; $risky | ForEach-Object { Say ('    ' + $_) }; $bad = $true }
+    $k = Get-ADUser krbtgt -Properties pwdLastSet
+    if ($k) { Say ('  krbtgt password last set: ' + [datetime]::FromFileTime($k.pwdLastSet) + '   (Golden Ticket defense: reset it twice, 10+ hours apart)') }
+    if ($bad) { Flag; Nxt 'unlock scored users (Unlock-ADAccount <name>), re-enable Administrator, and find the source of the guessing (events below).' }
+}
+
+function Check-Bait {
+    param([datetime]$Since)
+    if (-not $script:BaitPath) { return }
+    Sec 'bait' 'Your bait file and bait login (T1552.001: someone went looking for passwords)'
+    Say ('  bait file: ' + $script:BaitPath + '   bait login name: ' + $script:BaitUser)
+    $out = @()
+    if (-not (Test-Path -LiteralPath $script:BaitPath)) { $out += '  the bait file is GONE: someone deleted or moved it' }
+    $ignore = '(?i)\\(MsMpEng|MpDefenderCoreService|NisSrv|SearchProtocolHost|SearchIndexer|SearchFilterHost)\.exe$'
+    foreach ($e in @(Get-Evt 'Security' (XSince @(4663) $script:BaitTime) 300)) {
+        if ((EvData $e 'ObjectName') -ne $script:BaitPath) { continue }
+        $pn = EvData $e 'ProcessName'
+        if ($pn -match $ignore) { continue }
+        $out += ('  ' + $e.TimeCreated.ToString('MM-dd HH:mm') + '  opened by ' + (EvData $e 'SubjectDomainName') + '\' + (EvData $e 'SubjectUserName') + ' using ' + $pn)
+    }
+    if ($script:BaitUser) {
+        $xp = XSince @(4625, 4771, 4768) $script:BaitTime ("Data[@Name='TargetUserName']='" + $script:BaitUser + "'")
+        foreach ($e in @(Get-Evt 'Security' $xp 50)) {
+            $out += ('  ' + $e.TimeCreated.ToString('MM-dd HH:mm') + '  someone tried the bait login from ' + (EvData $e 'IpAddress') + ' (event ' + $e.Id + ')')
+        }
+    }
+    if ($out.Count -gt 0) {
+        Warn 'the bait was touched:'
+        $out | ForEach-Object { Say $_ }
+        Flag
+        Nxt 'this is red team. Note the time, account, program and address. Block the address, and hunt for how they got in.'
+    } else {
+        Good 'nobody has touched the bait'
+    }
+}
+
+function Check-Audit {
+    Sec 'audit' 'Windows auditing (T1562.002: with auditing off, there is nothing to hunt)'
+    $want = [ordered]@{
+        '{0CCE9215-69AE-11D9-BED3-505054503030}' = 'Logon'
+        '{0CCE922B-69AE-11D9-BED3-505054503030}' = 'Process Creation'
+        '{0CCE9235-69AE-11D9-BED3-505054503030}' = 'User Account Management'
+        '{0CCE9237-69AE-11D9-BED3-505054503030}' = 'Security Group Management'
+        '{0CCE922F-69AE-11D9-BED3-505054503030}' = 'Audit Policy Change'
+    }
+    if ($MyRole -eq 'dc') {
+        $want['{0CCE9240-69AE-11D9-BED3-505054503030}'] = 'Kerberos Service Ticket Operations'
+        $want['{0CCE9242-69AE-11D9-BED3-505054503030}'] = 'Kerberos Authentication Service'
+    }
+    $rows = @(auditpol /get /category:* /r 2>$null | ConvertFrom-Csv)
+    if ($rows.Count -eq 0) { Say '  could not read the audit policy'; return }
+    $off = @()
+    foreach ($g in $want.Keys) {
+        $r = $rows | Where-Object { $_.'Subcategory GUID' -eq $g } | Select-Object -First 1
+        if ($r -and $r.'Inclusion Setting' -match '(?i)no auditing') { $off += $want[$g] }
+    }
+    if ($off.Count -gt 0) {
+        Warn ('auditing is OFF for: ' + ($off -join ', '))
+        Flag
+        Nxt 'with your lead, turn them on, for example: auditpol /set /subcategory:"Logon" /success:enable /failure:enable'
+    } else {
+        Good 'logons, new processes, account and group changes, and audit policy changes are all audited'
+    }
+    $sec = Get-WinEvent -ListLog Security
+    if ($sec) { Say ('  Security log: ' + $sec.RecordCount + ' events, up to ' + [math]::Round($sec.MaximumSizeInBytes / 1MB) + ' MB') }
+}
+
+# "What happened since the last hunt", straight from the Windows event logs.
+function Show-Events {
+    param([datetime]$Since)
+    $hit = $false
+    $lines = @()
+    foreach ($e in @(Get-Evt 'Security' (XSince @(1102) $Since) 20)) { $lines += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  the Security log was CLEARED by ' + (EvData $e 'SubjectUserName') + ' (1102, T1070.001)'); $hit = $true }
+    foreach ($e in @(Get-Evt 'System' (XSince @(104) $Since) 20)) { $lines += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  the ' + (EvData $e 'Channel') + ' log was CLEARED by ' + (EvData $e 'SubjectUserName') + ' (104, T1070.001)'); $hit = $true }
+    $acct = @{ 4720 = 'account CREATED'; 4722 = 'account enabled'; 4725 = 'account disabled'; 4726 = 'account DELETED'; 4724 = 'password RESET'; 4723 = 'password changed' }
+    foreach ($e in @(Get-Evt 'Security' (XSince @(4720, 4722, 4725, 4726, 4724, 4723) $Since) 100)) {
+        $lines += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  ' + $acct[[int]$e.Id] + ': ' + (EvData $e 'TargetUserName') + ', by ' + (EvData $e 'SubjectUserName') + ' (' + $e.Id + ')')
+        if ($e.Id -eq 4720 -or $e.Id -eq 4726) { $hit = $true }
+    }
+    foreach ($e in @(Get-Evt 'Security' (XSince @(4728, 4732, 4756) $Since) 100)) {
+        $m = EvData $e 'MemberName'
+        if (-not $m -or $m -eq '-') { $m = EvData $e 'MemberSid' }
+        $lines += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  ADDED to group ' + (EvData $e 'TargetUserName') + ': ' + $m + ', by ' + (EvData $e 'SubjectUserName') + ' (' + $e.Id + ', T1098)')
+        $hit = $true
+    }
+    foreach ($e in @(Get-Evt 'System' (XSince @(7045) $Since) 50)) { $lines += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  NEW service ' + (EvData $e 'ServiceName') + ': ' + (EvData $e 'ImagePath') + ' (7045, T1543.003)'); $hit = $true }
+    foreach ($e in @(Get-Evt 'Security' (XSince @(4698) $Since) 50)) { $lines += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  NEW scheduled task ' + (EvData $e 'TaskName') + ', by ' + (EvData $e 'SubjectUserName') + ' (4698, T1053.005)'); $hit = $true }
+    foreach ($e in @(Get-Evt 'Security' (XSince @(4719) $Since) 20)) { $lines += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  audit policy CHANGED by ' + (EvData $e 'SubjectUserName') + ' (4719, T1562.002)'); $hit = $true }
+    foreach ($e in @(Get-Evt 'Microsoft-Windows-Windows Defender/Operational' (XSince @(5001, 5007) $Since) 20)) { $lines += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  Defender: ' + ((([string]$e.Message) -split "`n")[0]).Trim() + ' (' + $e.Id + ')'); $hit = $true }
+    $ps = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-PowerShell/Operational'; Id = 4104; Level = 3; StartTime = $Since } -MaxEvents 20 -ErrorAction SilentlyContinue)
+    foreach ($e in $ps) {
+        $sb = (EvData $e 'ScriptBlockText') -replace '\s+', ' '
+        if ($sb.Length -gt 140) { $sb = $sb.Substring(0, 140) + '...' }
+        $lines += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  PowerShell ran code Windows calls suspicious: ' + $sb + ' (4104, T1059.001)')
+        $hit = $true
+    }
+    # failed logons, by source address
+    $f = @(Get-Evt 'Security' (XSince @(4625) $Since) 2000 | ForEach-Object { EvMap $_ })
+    if ($f.Count -gt 0) {
+        $lines += ('  failed logons since then: ' + $f.Count + ' (4625). Top sources:')
+        $f | Group-Object { $_['IpAddress'] } | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object {
+            $acc = (($_.Group | ForEach-Object { $_['TargetUserName'] } | Sort-Object -Unique | Select-Object -First 5) -join ', ')
+            $lines += ('    ' + $_.Count + ' from ' + $_.Name + '  (accounts: ' + $acc + ')')
+            if ($_.Count -ge 20) { $hit = $true }
+        }
+    }
+    # logons over the network and RDP, by account and address
+    $xp = XSince @(4624) $Since "Data[@Name='LogonType']='10' or Data[@Name='LogonType']='3'"
+    $ok = @(Get-Evt 'Security' $xp 3000 | ForEach-Object { EvMap $_ } | Where-Object {
+        $u = $_['TargetUserName']; $a = $_['IpAddress']
+        $u -and $u -notlike '*$' -and $u -ne 'ANONYMOUS LOGON' -and $a -and $a -notin '-', '::1', '127.0.0.1' })
+    if ($ok.Count -gt 0) {
+        $lines += '  logons over the network (type 3) and RDP (type 10) since then:'
+        $ok | Group-Object { $_['TargetUserName'] + '|' + $_['IpAddress'] + '|' + $_['LogonType'] } | Sort-Object Count -Descending | Select-Object -First 12 | ForEach-Object {
+            $p = $_.Name -split '\|'
+            $m = ''
+            if (Test-Outside $p[1]) { $m = '   <- from outside your networks'; $hit = $true }
+            $lines += ('    ' + $p[0] + ' from ' + $p[1] + ' (type ' + $p[2] + ') x' + $_.Count + $m)
+        }
+    }
+    if ($MyRole -eq 'dc') {
+        $xk = XSince @(4769) $Since "Data[@Name='TicketEncryptionType']='0x17'"
+        $rc4 = @(Get-Evt 'Security' $xk 2000 | ForEach-Object { EvMap $_ } | Where-Object { $s = $_['ServiceName']; $s -and $s -notlike '*$' -and $s -ne 'krbtgt' })
+        if ($rc4.Count -gt 0) {
+            if ($script:LearnOn) { Show-Learn 'kerberos' }
+            $lines += ('  RC4 service tickets (4769, 0x17) since then: ' + $rc4.Count + '. Many for different accounts from one address is Kerberoasting (T1558.003):')
+            $rc4 | Group-Object { $_['TargetUserName'] + ' from ' + $_['IpAddress'] } | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object {
+                $svcs = @($_.Group | ForEach-Object { $_['ServiceName'] } | Sort-Object -Unique)
+                $lines += ('    ' + $_.Name + ': ' + $_.Count + ' tickets for ' + (($svcs | Select-Object -First 6) -join ', '))
+                if ($svcs.Count -ge 3) { $hit = $true }
+            }
+        }
+        $xa = XSince @(4768) $Since "Data[@Name='PreAuthType']='0'"
+        $asr = @(Get-Evt 'Security' $xa 200)
+        if ($asr.Count -gt 0) {
+            $lines += ('  logons without Kerberos pre-auth (4768, AS-REP roasting, T1558.004): ' + $asr.Count)
+            $asr | Group-Object { (EvData $_ 'TargetUserName') + ' from ' + (EvData $_ 'IpAddress') } | Select-Object -First 5 | ForEach-Object { $lines += ('    ' + $_.Name + ' x' + $_.Count) }
+            $hit = $true
+        }
+        foreach ($e in @(Get-Evt 'Security' (XSince @(4740) $Since) 50)) { $lines += ('  ' + $e.TimeCreated.ToString('HH:mm') + '  account LOCKED OUT: ' + (EvData $e 'TargetUserName') + ' (caller ' + (EvData $e 'TargetDomainName') + ')') }
+    }
+    return @{ Lines = $lines; Hit = $hit }
+}
+
+function Get-NewFiles {
+    param([datetime]$Since)
+    $exts = '.exe', '.dll', '.sys', '.ps1', '.psm1', '.bat', '.cmd', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.hta', '.scr', '.msi', '.lnk', '.jar', '.aspx', '.asp', '.ashx', '.asmx', '.php', '.jsp', '.war', '.py'
+    $spots = @(
+        @{ P = "$env:windir\System32"; D = 0 }, @{ P = "$env:windir\SysWOW64"; D = 0 }, @{ P = "$env:windir\System32\drivers"; D = 0 },
+        @{ P = "$env:windir\Temp"; D = 2 }, @{ P = "$env:windir\Tasks"; D = 0 }, @{ P = 'C:\ProgramData'; D = 2 }, @{ P = 'C:\Users\Public'; D = 3 },
+        @{ P = 'C:\PerfLogs'; D = 2 }, @{ P = 'C:\'; D = 0 }, @{ P = 'C:\inetpub'; D = 4 }, @{ P = $env:ProgramFiles; D = 2 }, @{ P = ${env:ProgramFiles(x86)}; D = 2 }
+    )
+    foreach ($u in @(Get-ChildItem 'C:\Users' -Directory -Force)) {
+        foreach ($sub in 'AppData\Local\Temp', 'AppData\Roaming', 'Desktop', 'Downloads', 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup') {
+            $spots += @{ P = (Join-Path $u.FullName $sub); D = 1 }
+        }
+    }
+    foreach ($s in $spots) {
+        if (-not $s.P -or -not (Test-Path $s.P)) { continue }
+        Get-ChildItem -Path $s.P -File -Force -Recurse -Depth $s.D -ErrorAction SilentlyContinue | Where-Object {
+            ($exts -contains $_.Extension.ToLower()) -and ($_.CreationTime -gt $Since -or $_.LastWriteTime -gt $Since) -and
+            ($_.Name -notmatch '^(?i)(pagefile|swapfile|hiberfil)\.sys$')
+        }
+    }
+}
+
+function Every-Check {
+    param([datetime]$Since)
+    Check-RAT
+    Check-C2
+    Check-Programs
+    Check-CmdLines
+    Check-Services
+    Check-Drivers
+    Check-Tasks
+    Check-Persist
+    Check-Wmi
+    Check-Profiles
+    Check-Defender $Since
+    Check-Firewall
+    Check-Rootkit
+    Check-Accounts
+    Check-Logins
+    Check-Spam $Since
+    Check-Bits
+    Check-Ads
+    Check-Web
+    Check-Ransom
+    if ($MyRole -eq 'dc') { Check-DC }
+    Check-Bait $Since
+    Check-Audit
+}
+
+function Show-Summary {
+    Say ''
+    Say '======================================================================'
+    if ($script:Found.Count -eq 0) {
+        Good 'SUMMARY: nothing to look at.'
+    } else {
+        Warn ('SUMMARY: ' + $script:Found.Count + ' things to look at (top first):')
+        $script:Found | ForEach-Object { Say ('  - ' + $_) }
+        Say 'For each one: write down the time and what you see (menu 6, or: first30.ps1 note -Text "..."), tell your lead,'
+        Say 'and save evidence before you delete anything (menu 5, or: first30.ps1 evidence -Path <file>).'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# hunt
+# ---------------------------------------------------------------------------
+function Run-Hunt {
+    $script:Found.Clear()
+    if (-not (Test-Path $BaseDir)) { Warn 'No baseline yet. Run the start of game first (menu 1, or: first30.ps1 all).'; return }
+    New-Snapshot
+    Say ('Hunt on ' + $env:COMPUTERNAME + ' at ' + (Get-Date).ToString('HH:mm') + ' (' + (UtcNow) + ')')
+    Say ('Baseline seal: ' + (Get-Seal $BaseDir) + '   <- must match your paper. If not, someone edited the baseline: tell your lead.')
+    $prev = Get-PrevDir
+    if (-not $prev) { $prev = $BaseDir }
+    $prevTime = Get-DirTime $prev
+    if (-not (Test-Path $LastHuntFile)) {
+        $label = 'the start of the game (' + $prevTime.ToString('HH:mm') + ')'
+        Say 'First hunt: comparing with the start-of-game snapshot.'
+    } else {
+        $label = 'your last hunt (' + $prevTime.ToString('HH:mm') + ')'
+        Say ('Last hunt: ' + $prevTime.ToString('HH:mm') + ', its seal ' + (Get-Seal $prev) + ' (should match what you posted)')
+    }
+    Check-Self
+    Collect-Common
+    if ($MyRole -eq 'dc') { Collect-DC }
+    $items = [ordered]@{}
+    foreach ($k in $DiffItems.Keys) { $items[$k] = $DiffItems[$k] }
+    if ($MyRole -eq 'dc') { foreach ($k in $DcDiffItems.Keys) { $items[$k] = $DcDiffItems[$k] } }
+    $details = @()
+
+    # ---- part 1: the last 30 minutes
+    Sec 'last' ('1. What changed since ' + $label)
+    $changed = $false
+    foreach ($k in $items.Keys) {
+        $cur = Read-Lines (Join-Path $script:SnapDir ($k + '.txt'))
+        $old = Read-Lines (Join-Path $prev ($k + '.txt'))
+        if ($null -eq $cur -or $null -eq $old) { continue }
+        $d = Compare-Lines $old $cur
+        if ($d.New.Count -eq 0 -and $d.Gone.Count -eq 0) { continue }
+        $changed = $true
+        Warn ($items[$k] + ': ' + $d.New.Count + ' new, ' + $d.Gone.Count + ' gone')
+        $d.New  | Select-Object -First 15 | ForEach-Object { Say ('    NEW   ' + $_) }
+        $d.Gone | Select-Object -First 15 | ForEach-Object { Say ('    GONE  ' + $_) }
+        if ($d.New.Count -gt 15 -or $d.Gone.Count -gt 15) { Say '    ... the rest is in the details file' }
+        $details += ('== ' + $items[$k] + ' since ' + $label)
+        $details += ($d.New | ForEach-Object { 'NEW   ' + $_ })
+        $details += ($d.Gone | ForEach-Object { 'GONE  ' + $_ })
+    }
+    if (-not $changed) { Good 'nothing in the inventory changed' } else { Flag }
+    if ($script:LearnOn) { Show-Learn 'files' }
+    $nf = @(Get-NewFiles $prevTime | Sort-Object LastWriteTime)
+    if ($nf.Count -gt 0) {
+        Say ('  New or changed programs and scripts since then (' + $nf.Count + '):')
+        $nf | Select-Object -Last 30 | ForEach-Object {
+            $sg = ''
+            if ($_.Extension -match '(?i)^\.(exe|dll|sys|msi|ps1)$') { $sg = '  [' + (Get-SigStatus $_.FullName) + ']' }
+            Say ('    ' + $_.LastWriteTime.ToString('HH:mm') + '  ' + $_.FullName + '  (' + $_.Length + ' bytes)' + $sg)
+        }
+        $details += '== new or changed programs and scripts'
+        $details += ($nf | ForEach-Object { $_.LastWriteTime.ToString('yyyy-MM-dd HH:mm') + '  ' + $_.FullName })
+        if ($nf | Where-Object { Test-UserWritable $_.FullName }) { Flag }
+    } else {
+        Say '  No new programs or scripts in the system, temp, user and web folders since then.'
+    }
+    if ($script:LearnOn) { Show-Learn 'events' }
+    $ev = Show-Events $prevTime
+    if ($ev.Lines.Count -gt 0) {
+        Say '  From the Windows event logs since then:'
+        $ev.Lines | ForEach-Object { Say $_ }
+        if ($ev.Hit) { Flag }
+    } else {
+        Say '  Nothing new in the event logs that matters (no new accounts, services, tasks, cleared logs or guessing).'
+    }
+    $seen = 0
+    if (Test-Path $NotesSeenFile) { [int]::TryParse((Get-Content $NotesSeenFile | Select-Object -First 1), [ref]$seen) | Out-Null }
+    $all = @()
+    if (Test-Path $NotesFile) { $all = @(Get-Content $NotesFile) }
+    if ($all.Count -gt $seen) {
+        Say '  Team notes since then (the changes your team made):'
+        $all | Select-Object -Skip $seen | ForEach-Object { Say ('    ' + $_) }
+    } else {
+        Say '  No team notes since then. Changed something? Write it down (menu 6, or: first30.ps1 note -Text "what you did").'
+    }
+    Set-Content -Path $NotesSeenFile -Value $all.Count
+    Nxt 'anything above that is NOT in your team notes was done by someone else. Start there.'
+
+    # ---- part 2: since the baseline, as counts
+    Sec 'base' ('2. Changed since the baseline (' + (Get-DirTime $BaseDir).ToString('HH:mm') + ')')
+    $sum = @()
+    foreach ($k in $items.Keys) {
+        $cur = Read-Lines (Join-Path $script:SnapDir ($k + '.txt'))
+        $old = Read-Lines (Join-Path $BaseDir ($k + '.txt'))
+        if ($null -eq $cur -or $null -eq $old) { continue }
+        $d = Compare-Lines $old $cur
+        if ($d.New.Count -or $d.Gone.Count) {
+            $sum += ('  ' + $items[$k] + ': ' + $d.New.Count + ' new, ' + $d.Gone.Count + ' gone')
+            $details += ('== ' + $items[$k] + ' since the baseline')
+            $details += ($d.New | ForEach-Object { 'NEW   ' + $_ })
+            $details += ($d.Gone | ForEach-Object { 'GONE  ' + $_ })
+        }
+    }
+    $detailFile = Join-Path $ReportDir ('hunt_' + $script:stamp + '_details.txt')
+    Set-Content -Path $detailFile -Value $details
+    if ($sum.Count -eq 0) { Good 'the box matches the baseline' } else { $sum | ForEach-Object { Say $_ }; Say ('  The full list is in ' + $detailFile + '. Part 1 shows the newest of these.') }
+
+    # ---- part 3: checks that run every time
+    Head '3. Checks that run every time (they do not trust the baseline)'
+    Every-Check $prevTime
+    Show-Summary
+    Say ('This hunt''s seal: ' + (Get-Seal $script:SnapDir) + '   <- post it in your team channel with the time.')
+    Set-Content -Path $LastHuntFile -Value $script:stamp
+    Say ('Next hunt: about ' + (Get-Date).AddMinutes(30).ToString('HH:mm') + '.')
+}
+
+# ---------------------------------------------------------------------------
+# backup (config copies you can restore or compare later)
+# ---------------------------------------------------------------------------
+function Run-Backup {
+    Head 'backup: config copies'
+    $cfg = Join-Path $script:SnapDir 'config'
+    New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+    netsh advfirewall export (Join-Path $cfg 'firewall.wfw') | Out-Null
+    Say '  saved config\firewall.wfw'
+    Copy-Item "$env:windir\System32\drivers\etc\hosts" (Join-Path $cfg 'hosts') -Force
+    Say '  saved config\hosts'
+    reg export 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' (Join-Path $cfg 'run_hklm.reg') /y | Out-Null
+    reg export 'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' (Join-Path $cfg 'run_hkcu.reg') /y | Out-Null
+    reg export 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa' (Join-Path $cfg 'lsa.reg') /y | Out-Null
+    reg export 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' (Join-Path $cfg 'winlogon.reg') /y | Out-Null
+    Say '  saved config\run_hklm.reg, run_hkcu.reg, lsa.reg, winlogon.reg'
+    schtasks /query /xml ONE 2>$null | Out-File -FilePath (Join-Path $cfg 'tasks.xml') -Encoding UTF8
+    Say '  saved config\tasks.xml'
+    if ($MyRole -eq 'dc' -and (Get-Command Backup-GPO -ErrorAction SilentlyContinue)) {
+        $gp = Join-Path $cfg 'gpo'
+        New-Item -ItemType Directory -Force -Path $gp | Out-Null
+        Backup-GPO -All -Path $gp | Out-Null
+        Say '  saved config\gpo (every Group Policy object)'
+    }
+    Good ('backup written to ' + $script:SnapDir)
+}
+
+function Make-Baseline {
+    if (-not (Test-Path $BaseDir)) {
+        Copy-Item $script:SnapDir $BaseDir -Recurse -Force
+        Good ('baseline created at ' + $BaseDir)
+        Good ('baseline seal: ' + (Get-Seal $BaseDir) + '   <- WRITE THIS ON PAPER, with the box name')
+        Auto-Note ('made the baseline (seal ' + (Get-Seal $BaseDir) + ')')
+    } else {
+        Say ('baseline already exists at ' + $BaseDir + ' (left as it is)')
+        Say ('baseline seal: ' + (Get-Seal $BaseDir) + '   (it must match your paper)')
+    }
+}
+
+# ---------------------------------------------------------------------------
+# recon (a fast picture on the screen, then every check)
+# ---------------------------------------------------------------------------
+function Run-Recon {
+    $script:Found.Clear()
+    Head ('recon: ' + $env:COMPUTERNAME + '  role=' + $MyRole)
+    Say ('OS: ' + (Get-CimInstance Win32_OperatingSystem).Caption)
+    Say ''
+    Say 'Local administrators:'
+    Get-LocalAdmins | ForEach-Object { Say ('  ' + $_) }
+    Say ''
+    Say 'Enabled local users:'
+    Get-LocalUser | Where-Object Enabled | Select-Object -ExpandProperty Name | ForEach-Object { Say ('  ' + $_) }
+    Say ''
+    Say 'Listening ports, the program, and the account it runs as (scored ones stay open):'
+    $li = @(Get-ListenInfo)
+    Show $li
+    $real = @($li | Where-Object { Test-RealAccount $_.Account })
+    if ($real.Count -gt 0) {
+        Warn 'These ports run as a real user account, not a built-in one. Real accounts that run services are Kerberoasting targets:'
+        $real | ForEach-Object { Say ('  ' + $_.Proto + ' ' + $_.Port + '  ' + $_.Process + '  ->  ' + $_.Account) }
+        Say '  Check each one: does it have an SPN, a long random password, and AES only?'
+    }
+    if ($MyRole -eq 'dc') {
+        Say ''
+        Say 'Domain Admins:'
+        try { (Get-ADGroupMember 'Domain Admins' -Recursive).name | ForEach-Object { Say ('  ' + $_) } } catch { net group "Domain Admins" /domain }
+    }
+    Check-Self
+    Every-Check ((Get-Date).AddHours(-2))
+    Show-Summary
+}
+
+function Run-All {
+    New-Snapshot
+    Collect-Common
+    if ($MyRole -eq 'dc') { Collect-DC }
+    Run-Backup
+    Make-Baseline
+    Run-Recon
+    Say ''
+    Head 'your first 30 minutes'
+    Say '  1. Write the baseline seal above on paper, with the box name.'
+    Say '  2. Change passwords (your lead has the plan), then write a note (menu 6).'
+    Say '  3. Go through every finding above with your lead.'
+    Say '  4. Stop pop-up spam and RDP screen watching (menu 11).'
+    Say '  5. Optional: plant a bait file (menu 10).'
+    Say '  6. Look for C2 (menu 3).'
+    Say '  7. Hunt every 30 minutes (menu 2).'
+}
+
+# ---------------------------------------------------------------------------
+# c2: programs talking OUT of this box, and a 30-second watch
+# ---------------------------------------------------------------------------
+# At the invitational, a dropper pulled the imix agent onto a Linux box, and it
+# called its C2 server at 10.197.114.55:8001 over HTTP. A Windows agent looks the
+# same from here: a program, often unsigned and in a user folder, that keeps
+# connecting to one address.
+function Run-C2 {
+    $script:Found.Clear()
+    Check-C2
+    Head 'c2: who keeps calling out? watching for 30 seconds...'
+    $first = @{}
+    $seen = @{}
+    for ($i = 0; $i -lt 6; $i++) {
+        foreach ($c in @(Get-OutboundConn -States 'Established', 'SynSent', 'TimeWait')) {
+            $key = $c.Remote + ':' + $c.Port + '|' + $c.Owner
+            $one = $key + '|' + $c.LPort
+            if ($i -eq 0) { $first[$one] = 1; continue }
+            if ($first.ContainsKey($one)) { continue }
+            if (-not $seen.ContainsKey($key)) { $seen[$key] = @{} }
+            $seen[$key][[string]$c.LPort] = $true
+        }
+        if ($i -lt 5) { Start-Sleep -Seconds 5 }
+    }
+    $procs = @{}
+    foreach ($p in @(Get-CimInstance Win32_Process)) { $procs[[int]$p.ProcessId] = $p }
+    # count only connections that were not there in the first look: a program
+    # that keeps a few connections open all the time is not calling out again and again
+    $hits = foreach ($k in @($seen.Keys)) {
+        if ($seen[$k].Count -ge 3) {
+            $parts = $k -split '\|'
+            $owner = [int]$parts[1]
+            $nm = '?'
+            if ($owner -eq 0) { $nm = '(connection already closed)' } elseif ($procs[$owner]) { $nm = $procs[$owner].Name }
+            [pscustomobject]@{ Count = $seen[$k].Count; To = $parts[0]; Program = $nm; Owner = $owner }
+        }
+    }
+    if ($hits) {
+        Warn 'these opened 3 or more new connections to the same place in 30 seconds.'
+        Say  '  A C2 agent checking in looks like this (so do some normal programs). Check each one:'
+        $hits | Sort-Object Count -Descending | ForEach-Object { Say ('    ' + $_.Count + ' new connections to ' + $_.To + ' from ' + $_.Program + ' (pid ' + $_.Owner + ')') }
+    } else {
+        Good 'nothing kept opening new connections to the same place'
+    }
+    Say ''
+    Say 'Write down the time, the program and the address first: that is your incident report.'
+    Say 'Save the program (menu 5), then cut the address off, in and out (menu 8, or: first30.ps1 block -Ip <address>)'
+}
+
+# ---------------------------------------------------------------------------
+# block / unblock: cut an address off in both directions
+# ---------------------------------------------------------------------------
+# Safety: it will not block this box, your own RDP session, the default gateway
+# or a DNS server. Never block the scoring engine: check the packet for it.
+function Run-Block {
+    Head 'block: cut addresses off, in and out'
+    $list = @($Ip | Where-Object { $_ })
+    $again = $false
+    if ($list.Count -eq 0) {
+        # no address given: put back every saved block
+        $list = @(Get-BlockList)
+        if ($list.Count -eq 0) { Warn 'Usage: first30.ps1 block -Ip <address>'; return }
+        Say ('putting back the saved blocks: ' + ($list -join ', '))
+        $again = $true
+    }
+    $keep = @()
+    $keep += @(Get-NetTCPConnection -LocalPort 3389 -State Established | Select-Object -ExpandProperty RemoteAddress)
+    $keep += @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -ExpandProperty NextHop)
+    $keep += @(Get-DnsClientServerAddress -AddressFamily IPv4 | Select-Object -ExpandProperty ServerAddresses)
+    $keep += @(Get-NetIPAddress -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress)
+    $keep = @($keep | Where-Object { $_ -and $_ -ne '0.0.0.0' } | ForEach-Object { ([string]$_) -replace '^::ffff:', '' } | Sort-Object -Unique)
+    $off = @(Get-NetFirewallProfile | Where-Object { $_.Enabled -eq 'False' } | Select-Object -ExpandProperty Name)
+    if ($off.Count -gt 0) {
+        Warn ('The firewall is OFF for: ' + ($off -join ', ') + '. Block rules do nothing there until it is on.')
+        Warn 'Tell the lead before turning it on: it can also block scored services.'
+    }
+    $gpo = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Where-Object { [string]$_.AllowLocalFirewallRules -eq 'False' } | Select-Object -ExpandProperty Name)
+    if ($gpo.Count -gt 0) { Warn ('A Group Policy ignores rules made on this box for: ' + ($gpo -join ', ') + '. Block it in that Group Policy instead (on the DC).') }
+    foreach ($a in $list) {
+        if (-not (Test-IPv4 $a)) { Warn ('skipped ' + $a + ': not an IPv4 address'); continue }
+        if ($a -match '^(127|0)\.') { Warn ('skipped ' + $a + ': that is this computer'); continue }
+        $hit = @($keep | Where-Object { Test-InNet $_ $a }) | Select-Object -First 1
+        if ($hit) { Warn ('skipped ' + $a + ': it covers ' + $hit + ' (this box, your RDP session, the gateway, or DNS)'); continue }
+        foreach ($d in 'Outbound', 'Inbound') {
+            $name = 'first30 block ' + $a + ' ' + $d
+            if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
+                New-NetFirewallRule -DisplayName $name -Direction $d -RemoteAddress $a -Action Block -Profile Any | Out-Null
+            }
+        }
+        $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm')
+        if (-not $again) {
+            Add-Content -Path $BlockFile -Value ($a + ' ' + $now + ' UTC ' + $env:COMPUTERNAME)
+            Auto-Note ('blocked ' + $a + ' in and out')
+        }
+        Good ('blocked ' + $a + ' in and out, at ' + $now + ' UTC on ' + $env:COMPUTERNAME)
+    }
+    Say ''
+    Say 'For the incident report: the time, this host, the address, and what it was doing'
+    Say '(C2 traffic is T1071, password guessing is T1110). Where else it shows up: first30.ps1 trace -Ip <address>'
+    Say ('The list is in ' + $BlockFile + '. To undo one: first30.ps1 unblock -Ip <address>')
+}
+
+function Run-Unblock {
+    Head 'unblock'
+    $list = @($Ip | Where-Object { $_ })
+    if ($list.Count -eq 0) { Warn 'Usage: first30.ps1 unblock -Ip <address>'; return }
+    foreach ($a in $list) {
+        Get-NetFirewallRule -DisplayName ('first30 block ' + $a + ' *') | Remove-NetFirewallRule
+        if (Test-Path $BlockFile) {
+            $rest = @(Get-Content $BlockFile | Where-Object { ($_ -split '\s+')[0] -ne $a })
+            Set-Content -Path $BlockFile -Value $rest
+        }
+        Auto-Note ('unblocked ' + $a)
+        Good ('unblocked ' + $a)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# notes, networks
+# ---------------------------------------------------------------------------
+function Run-Note {
+    if (-not $Text) { Warn 'Usage: first30.ps1 note -Text "what you did, and why"'; return }
+    $l = Add-Note $Text
+    Good ('saved in ' + $NotesFile + ':')
+    Say ('  ' + $l)
+    Say 'The next hunt shows it next to the changes, so everyone knows this one was yours.'
+}
+
+function Run-Notes {
+    if (Test-Path $NotesFile) { Get-Content $NotesFile | ForEach-Object { Say ('  ' + $_) } } else { Say 'No notes yet. Write one: first30.ps1 note -Text "what you did"' }
+}
+
+function Run-Nets {
+    $n = @($OurNets | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($n.Count -eq 0) {
+        if (Test-Path $NetsFile) { Say ('Your networks: ' + ((Get-Content $NetsFile) -join ', ')) } else { Say 'No networks saved. Example: first30.ps1 nets -OurNets 10.100.130.0/24,192.168.220.0/24' }
+        return
+    }
+    foreach ($x in $n) { if (-not (Test-IPv4 $x)) { Warn ('Not an IPv4 network: ' + $x + ' (example: 10.100.130.0/24)'); return } }
+    Set-Content -Path $NetsFile -Value $n
+    $script:Nets = $n
+    Good ('saved. Addresses outside ' + ($n -join ', ') + ' are now marked in hunt, c2 and the login checks.')
+}
+
+# ---------------------------------------------------------------------------
+# evidence: copy a suspicious file into the vault with its fingerprint and what
+# uses it. The original is not touched. That is what the incident report needs.
+# ---------------------------------------------------------------------------
+function Run-Evidence {
+    if (-not $Path) { Warn 'Usage: first30.ps1 evidence -Path C:\full\path\to\file'; return }
+    if (-not (Test-Path -LiteralPath $Path)) { Warn ('Not found: ' + $Path); return }
+    $full = (Resolve-Path -LiteralPath $Path).Path
+    $qd = Join-Path $Vault 'quarantine'
+    New-Item -ItemType Directory -Force -Path $qd | Out-Null
+    $st = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+    $dest = Join-Path $qd ($st + '_' + $env:COMPUTERNAME + '_' + (Split-Path $full -Leaf) + '.evidence')
+    $it = Get-Item -LiteralPath $full -Force
+    if ($it.PSIsContainer) {
+        $dest = $dest + '.zip'
+        Compress-Archive -Path $full -DestinationPath $dest -Force
+    } else {
+        Copy-Item -LiteralPath $full -Destination $dest -Force
+    }
+    $h = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
+    if (-not $it.PSIsContainer) { $h = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash }
+    $r = @()
+    $r += ('== Evidence saved ' + (UtcNow) + ' on ' + $env:COMPUTERNAME)
+    $r += ('original : ' + $full)
+    $r += ('copy     : ' + $dest + '   (renamed so it cannot run; the original was not touched)')
+    $r += ('sha256   : ' + $h)
+    $r += ('size     : ' + $it.Length + ' bytes; created ' + $it.CreationTime + '; changed ' + $it.LastWriteTime)
+    $r += ('owner    : ' + (Get-Acl -LiteralPath $full).Owner)
+    if (-not $it.PSIsContainer) {
+        $sig = Get-AuthenticodeSignature -LiteralPath $full
+        $r += ('signed   : ' + $sig.Status + ' ' + $(if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }))
+        $vi = $it.VersionInfo
+        if ($vi) { $r += ('version  : ' + $vi.CompanyName + ' / ' + $vi.ProductName + ' / original name ' + $vi.OriginalFilename) }
+        $ads = @(Get-Item -LiteralPath $full -Stream * | Where-Object { $_.Stream -ne ':$DATA' } | ForEach-Object { $_.Stream + ' (' + $_.Length + ' bytes)' })
+        if ($ads.Count -gt 0) { $r += ('streams  : ' + ($ads -join ', ')) }
+    }
+    $r += 'running  :'
+    $r += @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $full } | ForEach-Object { '    pid ' + $_.ProcessId + ' ' + $_.CommandLine })
+    $r += 'used by (services, tasks, Run keys):'
+    $r += @(Get-CimInstance Win32_Service | Where-Object { $_.PathName -like ('*' + $full + '*') } | ForEach-Object { '    service ' + $_.Name + ' (' + $_.State + ')' })
+    $r += @(Get-ScheduledTask | Where-Object { ($_.Actions | ForEach-Object { [string]$_.Execute + ' ' + [string]$_.Arguments }) -like ('*' + $full + '*') } | ForEach-Object { '    task ' + $_.TaskPath + $_.TaskName })
+    $r += @(Get-Autoruns | Where-Object { $_ -like ('*' + $full + '*') } | ForEach-Object { '    ' + $_ })
+    $r += ''
+    $r | ForEach-Object { Say $_ }
+    Add-Content -Path (Join-Path $qd 'evidence_log.txt') -Value $r
+    Auto-Note ('saved evidence: ' + $full + ' (sha256 ' + $h.Substring(0, 16) + '...)')
+    Say 'Defender may remove the copy if it knows the file; the fingerprint above is already saved.'
+    Say 'Next, with your lead:'
+    Say ('  1. Write it down: the time, ' + $env:COMPUTERNAME + ', the path, the sha256 above, and what it did (MITRE number).')
+    Say '  2. Stop what runs it (Task Manager > End task, or stop and disable the service).'
+    Say '  3. Remove what starts it again (the service, task or Run key named above).'
+    Say '  4. Only then delete or move the original.'
+    Say ('The log of everything saved: ' + (Join-Path $qd 'evidence_log.txt'))
+}
+
+# ---------------------------------------------------------------------------
+# trace: where has an address shown up on this box? First and last time seen,
+# which the incident report needs (like find_malicious_ip in the hunting guide).
+# ---------------------------------------------------------------------------
+function Run-Trace {
+    $a = @($Ip | Where-Object { $_ }) | Select-Object -First 1
+    if (-not $a -or -not (Test-IPv4 $a)) { Warn 'Usage: first30.ps1 trace -Ip <IPv4 address>'; return }
+    Head ('where has ' + $a + ' shown up on ' + $env:COMPUTERNAME + '?')
+    $xp = "*[EventData[Data[@Name='IpAddress']='" + $a + "' or Data[@Name='IpAddress']='::ffff:" + $a + "']]"
+    $ev = @(Get-Evt 'Security' $xp 5000)
+    if ($ev.Count -gt 0) {
+        $names = @{ 4624 = 'logon worked'; 4625 = 'logon FAILED'; 4648 = 'logon with typed credentials'; 4768 = 'Kerberos logon ticket'; 4769 = 'Kerberos service ticket'; 4771 = 'Kerberos pre-auth FAILED'; 4776 = 'NTLM check' }
+        Say ('  Security log: ' + $ev.Count + ' events. First ' + ($ev | Select-Object -Last 1).TimeCreated + ', last ' + ($ev | Select-Object -First 1).TimeCreated)
+        $ev | Group-Object Id | ForEach-Object {
+            $accts = (($_.Group | ForEach-Object { EvData $_ 'TargetUserName' } | Sort-Object -Unique | Select-Object -First 6) -join ', ')
+            Say ('    ' + $_.Count + ' x ' + $_.Name + ' ' + $names[[int]$_.Name] + '  (accounts: ' + $accts + ')')
+        }
+    } else {
+        Say '  not in the Security log'
+    }
+    $fw = "$env:windir\System32\LogFiles\Firewall\pfirewall.log"
+    if (Test-Path $fw) {
+        $m = @(Select-String -Path $fw -SimpleMatch $a)
+        if ($m.Count -gt 0) { Say ('  firewall log: ' + $m.Count + ' lines. First: ' + $m[0].Line); Say ('                 last:  ' + $m[-1].Line) }
+    }
+    $iis = @(Get-ChildItem 'C:\inetpub\logs\LogFiles' -Recurse -File -Filter *.log)
+    if ($iis.Count -gt 0) {
+        $m = @($iis | Select-String -SimpleMatch $a)
+        if ($m.Count -gt 0) { Say ('  web server logs: ' + $m.Count + ' requests. First: ' + $m[0].Line); Say ('                    last:  ' + $m[-1].Line) }
+    }
+    $now = @(Get-NetTCPConnection | Where-Object { (([string]$_.RemoteAddress) -replace '^::ffff:', '') -eq $a })
+    if ($now.Count -gt 0) { Say '  connected right now:'; $now | ForEach-Object { Say ('    ' + $_.State + ' local port ' + $_.LocalPort + ' -> ' + $_.RemotePort + ' (pid ' + $_.OwningProcess + ')') } } else { Say '  no open connection with it right now' }
+    if ((Get-BlockList) -contains $a) { Say '  blocked: yes' } else { Say ('  blocked: no. To block it: first30.ps1 block -Ip ' + $a) }
+    Say ('Write it down: first30.ps1 note -Text "' + $a + ': first seen ..., last seen ..., did ..."')
+}
+
+# ---------------------------------------------------------------------------
+# bait: a file that looks like it holds an old password. Nobody on your team
+# opens it, so anyone who does is red team. Windows logs who opened it (event
+# 4663), and the made-up login name inside shows in failed logons if they try it.
+# ---------------------------------------------------------------------------
+function Run-Bait {
+    if (-not $Path) {
+        if ($script:BaitPath) { Say ('Bait planted: ' + $script:BaitPath + ' (login name ' + $script:BaitUser + ')') }
+        else { Warn 'Usage: first30.ps1 bait -Path C:\Users\Public\Documents\<a believable name only your team knows>' }
+        return
+    }
+    if ($script:BaitPath) { Warn ('A bait is already planted: ' + $script:BaitPath + '. One per box.'); return }
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($full -match '(?i)^[a-z]:\\(inetpub|windows)\\' -or $full.StartsWith($Vault, [StringComparison]::OrdinalIgnoreCase)) {
+        Warn 'Not under C:\inetpub, C:\Windows or the vault (this script reads web files itself). Try C:\Users\Public\Documents.'
+        return
+    }
+    if (Test-Path -LiteralPath $full) { Warn ($full + ' already exists. Pick a new file name.'); return }
+    if (-not (Test-Path -LiteralPath (Split-Path $full -Parent))) { Warn ('The folder ' + (Split-Path $full -Parent) + ' does not exist.'); return }
+    $n = Get-Random -Minimum 10 -Maximum 99
+    $user = ''
+    foreach ($w in 'backup', 'deploy', 'report', 'monitor', 'sync') {
+        $user = 'svc_' + $w + $n
+        if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) -and -not ((net user $user /domain 2>$null) -match 'User name')) { break }
+    }
+    $pw = -join ((48..57) + (97..122) | Get-Random -Count 14 | ForEach-Object { [char]$_ })
+    Set-Content -Path $full -Value @('# old service login - moved to the vault, do not use', ('server=' + $env:COMPUTERNAME), ('user=' + $user), ('password=' + $pw))
+    # log every read of this one file: a SACL on it, and file-system auditing on
+    $acl = Get-Acl -LiteralPath $full -Audit
+    $everyone = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
+    $rule = New-Object System.Security.AccessControl.FileSystemAuditRule($everyone, 'ReadData, Delete, WriteData', 'Success')
+    $acl.AddAuditRule($rule)
+    Set-Acl -LiteralPath $full -AclObject $acl
+    auditpol /set "/subcategory:{0CCE921D-69AE-11D9-BED3-505054503030}" /success:enable | Out-Null
+    Set-Content -Path $BaitFile -Value @($full, $user, (Get-Date).ToString('o'))
+    $script:BaitPath = $full
+    $script:BaitUser = $user
+    Auto-Note ('planted the bait (details in ' + $BaitFile + ')')
+    Good ('bait planted: ' + $full + '   (made-up login name inside: ' + $user + ')')
+    Say  '  Windows now logs anyone who opens it (event 4663). File-system auditing was turned on for it.'
+    Say  '  Never open the bait yourself. Do not tell anyone where it is outside your team.'
+}
+
+# ---------------------------------------------------------------------------
+# quiet: stop pop-up spam from other machines and RDP screen watching. Two
+# registry settings, saved first so undo-quiet can put them back. An admin on
+# this box can still run msg.exe locally: then find that session and log it off.
+# ---------------------------------------------------------------------------
+function Run-Quiet {
+    Head 'quiet: stop pop-up spam and screen watching'
+    $undo = Join-Path $Vault 'quiet_undo.txt'
+    if (-not (Test-Path $undo)) {
+        Set-Content -Path $undo -Value @(('AllowRemoteRPC|' + [string](Get-ItemProperty $TsKey).AllowRemoteRPC), ('Shadow|' + [string](Get-ItemProperty $TsPolicy).Shadow))
+    }
+    New-ItemProperty -Path $TsKey -Name AllowRemoteRPC -Value 0 -PropertyType DWord -Force | Out-Null
+    Good 'AllowRemoteRPC = 0: other machines can no longer send pop-ups (msg /server) or list and kick sessions'
+    if (-not (Test-Path $TsPolicy)) { New-Item -Path $TsPolicy -Force | Out-Null }
+    New-ItemProperty -Path $TsPolicy -Name Shadow -Value 0 -PropertyType DWord -Force | Out-Null
+    Good 'RDP Shadow = 0: nobody can shadow (watch or control) your RDP sessions'
+    $m = @(Get-Process -Name msg -ErrorAction SilentlyContinue)
+    if ($m.Count -gt 0) { $m | Stop-Process -Force; Good ('stopped ' + $m.Count + ' running msg.exe') }
+    Auto-Note 'turned on spam protection: AllowRemoteRPC 0, RDP Shadow 0 (undo: first30.ps1 undo-quiet)'
+    Say ''
+    Say 'An admin on this box can still send pop-ups locally. If they keep coming: quser shows the sessions;'
+    Say 'log off the one you do not know (Task Manager > Users > Sign off), then change that account''s password.'
+    Say 'A domain Group Policy can set Shadow again at the next refresh: hunt shows it if that happens.'
+}
+
+function Run-UndoQuiet {
+    $undo = Join-Path $Vault 'quiet_undo.txt'
+    if (-not (Test-Path $undo)) { Warn 'Nothing to undo: spam protection was not turned on with this script.'; return }
+    foreach ($l in (Get-Content $undo)) {
+        $p = $l -split '\|', 2
+        $key = $TsKey
+        if ($p[0] -eq 'Shadow') { $key = $TsPolicy }
+        if ($p[1] -eq '') { Remove-ItemProperty -Path $key -Name $p[0] -ErrorAction SilentlyContinue; Good ($p[0] + ': removed (it was not set before)') }
+        else { New-ItemProperty -Path $key -Name $p[0] -Value ([int]$p[1]) -PropertyType DWord -Force | Out-Null; Good ($p[0] + ': back to ' + $p[1]) }
+    }
+    Remove-Item $undo -Force
+    Auto-Note 'turned spam protection off (undo-quiet)'
+}
+
+# ---------------------------------------------------------------------------
+# menu
+# ---------------------------------------------------------------------------
+function Invoke-Action {
+    param([string]$Name, [scriptblock]$Do)
+    $log = Join-Path $ReportDir ($Name + '_' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.txt')
+    try { Start-Transcript -Path $log -Force | Out-Null } catch {}
+    try { & $Do } catch { Warn ('error: ' + $_.Exception.Message) }
+    try { Stop-Transcript | Out-Null } catch {}
+}
+
+function Show-MenuHeader {
+    Write-Host ''
+    Say '======================================================================'
+    Say ('first30 on ' + $env:COMPUTERNAME + ' (' + (Get-CimInstance Win32_OperatingSystem).Caption + ', role ' + $MyRole + ')   ' + (Get-Date).ToString('HH:mm'))
+    if (Test-Path $BaseDir) {
+        Say ('Baseline: made ' + (Get-DirTime $BaseDir).ToString('HH:mm') + ', seal ' + (Get-Seal $BaseDir) + ' (must match your paper)')
+        if (Test-Path $LastHuntFile) {
+            $ago = [int]((Get-Date) - (Get-Item $LastHuntFile).LastWriteTime).TotalMinutes
+            if ($ago -ge 30) { Warn ('Last hunt: ' + $ago + ' minutes ago  <- time to hunt (choice 2)') } else { Say ('Last hunt: ' + $ago + ' minutes ago') }
+        } else { Say 'No hunt yet. Hunt every 30 minutes (choice 2).' }
+    } else {
+        Warn 'No baseline yet: start with choice 1.'
+    }
+    if ($script:Nets.Count -gt 0) { Say ('Your networks: ' + ($script:Nets -join ', ')) } else { Say 'Your networks: not set (choice N)' }
+    if ($script:LearnOn) { Say 'Learn mode: ON (each check shows where to click and the command behind it)' } else { Say 'Learn mode: off' }
+    Say '----------------------------------------------------------------------'
+    Say '  1  Start of game: snapshot, baseline, config copies, every check  (read only; saves copies)'
+    Say '  2  Hunt: what changed? Run every 30 minutes                       (read only)'
+    Say '  3  Find C2: programs calling out (takes 30 seconds)               (read only)'
+    Say '  4  Trace an address: where has it shown up?                      (read only)'
+    Say '  5  Save evidence: copy a suspicious file safely                   (the original is not touched)'
+    Say '  6  Write a team note: what you changed and why'
+    Say '  7  Show the team notes'
+    Say '  8  Block an address, in and out                                  CHANGES the firewall'
+    Say '  9  Unblock an address                                            CHANGES the firewall'
+    Say ' 10  Plant a bait file                                             CHANGES: adds one file + its auditing'
+    Say ' 11  Stop pop-up spam and RDP screen watching                      CHANGES 2 registry settings'
+    Say '  N  Set your team''s networks (from the packet)'
+    Say '  L  Learn mode on/off'
+    Say '  Q  Quit'
+}
+
+function Run-Menu {
+    if (-not $script:LearnSet) { $script:LearnOn = $true }
+    while ($true) {
+        Show-MenuHeader
+        $c = Read-Host 'Type a choice and press Enter'
+        switch -Regex ($c) {
+            '^1$'  { Invoke-Action 'all' { Run-All }; Read-Host 'Press Enter to go back to the menu' | Out-Null }
+            '^2$'  { Invoke-Action 'hunt' { Run-Hunt }; Read-Host 'Press Enter to go back to the menu' | Out-Null }
+            '^3$'  { Invoke-Action 'c2' { Run-C2 }; Read-Host 'Press Enter to go back to the menu' | Out-Null }
+            '^4$'  { $script:Ip = @(Read-Host 'Address to trace (like 10.194.194.85)'); Invoke-Action 'trace' { Run-Trace }; Read-Host 'Press Enter to go back to the menu' | Out-Null }
+            '^5$'  { $script:Path = Read-Host 'Full path of the file (like C:\Users\Public\x.exe)'; Invoke-Action 'evidence' { Run-Evidence }; Read-Host 'Press Enter to go back to the menu' | Out-Null }
+            '^6$'  { $script:Text = Read-Host 'Type the note (example: changed the Administrator password; removed task Updater)'; if ($script:Text) { Run-Note }; Read-Host 'Press Enter to go back to the menu' | Out-Null }
+            '^7$'  { Run-Notes; Read-Host 'Press Enter to go back to the menu' | Out-Null }
+            '^8$'  {
+                $a = Read-Host 'Address to block (like 10.197.114.55). Never the scoring engine'
+                if ((Read-Host ('Block ' + $a + ' in and out of ' + $env:COMPUTERNAME + '? Type yes to go ahead')) -eq 'yes') { $script:Ip = @($a); Invoke-Action 'block' { Run-Block } }
+                Read-Host 'Press Enter to go back to the menu' | Out-Null
+            }
+            '^9$'  {
+                $a = Read-Host 'Address to unblock'
+                if ((Read-Host ('Unblock ' + $a + '? Type yes to go ahead')) -eq 'yes') { $script:Ip = @($a); Run-Unblock }
+                Read-Host 'Press Enter to go back to the menu' | Out-Null
+            }
+            '^10$' { $script:Path = Read-Host 'Where should the bait go? A believable name only your team knows, like C:\Users\Public\Documents\old_sql_login.txt'; if ($script:Path) { Run-Bait }; Read-Host 'Press Enter to go back to the menu' | Out-Null }
+            '^11$' {
+                Say 'This sets AllowRemoteRPC = 0 and RDP Shadow = 0, and stops running msg.exe.'
+                if ((Read-Host 'Type yes to go ahead') -eq 'yes') { Run-Quiet }
+                Read-Host 'Press Enter to go back to the menu' | Out-Null
+            }
+            '^[nN]$' { $script:OurNets = @(Read-Host 'Your team''s networks from the packet, separated by commas (like 10.100.130.0/24,192.168.220.0/24)'); Run-Nets; Read-Host 'Press Enter to go back to the menu' | Out-Null }
+            '^[lL]$' { $script:LearnOn = -not $script:LearnOn }
+            '^[qQ]$' { return }
+            default  { if ($c) { Say 'Pick one of the choices in the list.' } }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+$IsAdmin = Test-Admin
+if (-not $IsAdmin) {
+    if ($Mode -eq 'menu' -and $PSCommandPath -and [Environment]::UserInteractive) {
+        Warn 'This needs to run as Administrator.'
+        if ((Read-Host 'Open it again as Administrator now? (y/n)') -match '^(?i)y') {
+            Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"')
+            return
+        }
+    }
+    Warn 'Not elevated. Right-click PowerShell and Run as Administrator, then run this again.'
+    Warn 'Continuing anyway, but many checks will be blank.'
+}
+
+$MyRole        = Get-Role
+$script:stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
+$script:SnapDir = Join-Path $Vault $script:stamp
+$BaseDir       = Join-Path $Vault 'baseline'
+$ReportDir     = Join-Path $Vault 'reports'
+$BlockFile     = Join-Path $Vault 'blocked.txt'
+$NotesFile     = Join-Path $Vault 'notes.txt'
+$NotesSeenFile = Join-Path $Vault '.notes_seen'
+$LastHuntFile  = Join-Path $Vault '.lasthunt'
+$NetsFile      = Join-Path $Vault 'ournets.txt'
+$BaitFile      = Join-Path $Vault 'bait.txt'
+New-Item -ItemType Directory -Force -Path $Vault | Out-Null
+New-Item -ItemType Directory -Force -Path $ReportDir | Out-Null
+if ($IsAdmin) { Lock-Vault }
+$script:LearnSet = $PSBoundParameters.ContainsKey('Learn')
+
+# game-day settings saved in the vault: your networks and the bait
+$script:Nets = @($OurNets | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($script:Nets.Count -eq 0 -and (Test-Path $NetsFile)) { $script:Nets = @(Get-Content $NetsFile | Where-Object { $_ }) }
+$script:BaitPath = ''; $script:BaitUser = ''; $script:BaitTime = (Get-Date).AddDays(-1)
+if (Test-Path $BaitFile) {
+    $b = @(Get-Content $BaitFile)
+    $script:BaitPath = $b[0]
+    $script:BaitUser = $b[1]
+    try { $script:BaitTime = [datetime]::Parse($b[2]) } catch {}
+}
+
+Say ('first30.ps1  host=' + $env:COMPUTERNAME + '  role=' + $MyRole + '  mode=' + $Mode + '  vault=' + $Vault)
+
+switch ($Mode) {
+    'menu'     { Run-Menu }
+    'recon'    { Invoke-Action 'recon' { Run-Recon } }
+    'backup'   { Invoke-Action 'backup' { New-Snapshot; Collect-Common; if ($MyRole -eq 'dc') { Collect-DC }; Run-Backup; Make-Baseline } }
+    'all'      { Invoke-Action 'all' { Run-All } }
+    'hunt'     { Invoke-Action 'hunt' { Run-Hunt } }
+    'c2'       { Invoke-Action 'c2' { Run-C2 } }
+    'trace'    { Invoke-Action 'trace' { Run-Trace } }
+    'evidence' { Invoke-Action 'evidence' { Run-Evidence } }
+    'note'     { Run-Note }
+    'notes'    { Run-Notes }
+    'nets'     { Run-Nets }
+    'block'    { Invoke-Action 'block' { Run-Block } }
+    'unblock'  { Run-Unblock }
+    'bait'     { Run-Bait }
+    'quiet'      { Run-Quiet }
+    'undo-quiet' { Run-UndoQuiet }
+}

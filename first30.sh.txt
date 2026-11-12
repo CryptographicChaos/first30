@@ -1,0 +1,2721 @@
+#!/bin/sh
+# first30.sh - the Linux "first 30 minutes" kit for CCDC.
+#
+# NEW PLAYER? Run it with no mode and pick from the menu:
+#     sudo sh first30.sh
+# The menu says what each choice does and whether it changes anything on the box.
+# Learn mode (on in the menu) prints the plain command behind every check, so you
+# can run it yourself and see how it works. From the command line:
+#     sudo sh first30.sh learn hunt
+#
+# What it does: inventory and a baseline at the start, backups, a hunt you run every
+# 30 minutes (what changed since the last hunt, plus checks for the tricks red team
+# used at Invitational 2 and the ones in the defensive-security guides), a C2
+# finder, blocking, saving evidence, tracing an address through the logs, team
+# notes, a bait file, and auditd setup. Everything is saved in /root/bk
+# (change with VAULT=/other/dir).
+#
+# This script is public, so assume red team has read every line. Nothing secret is
+# in it. The secret parts come from you when you run it: your own networks, the
+# addresses you block, where you plant the bait, and the seals you write on paper
+# or post in your team channel.
+
+# Restart in a clean environment that only uses the system's own tools. Red team
+# knows which commands this script runs, so this blocks look-alike commands planted
+# earlier in PATH, LD_PRELOAD tricks, and shell functions passed in from a tampered
+# login shell. Only the settings listed here are carried over.
+if [ -z "$FIRST30_CLEAN" ] && [ -f "$0" ] && [ -x /usr/bin/env ]; then
+    exec /usr/bin/env -i FIRST30_CLEAN=1 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        HOME="${HOME:-/root}" TERM="${TERM:-dumb}" SYSTEMD_PAGER=cat PAGER=cat \
+        VAULT="${VAULT:-/root/bk}" MAXMB="${MAXMB:-500}" OURNETS="${OURNETS:-}" \
+        LEARN="${LEARN:-}" SUDO_USER="${SUDO_USER:-}" \
+        SSH_CLIENT="${SSH_CLIENT:-}" /bin/sh "$0" "$@"
+fi
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset LD_PRELOAD LD_LIBRARY_PATH
+
+VAULT=${VAULT:-/root/bk}
+MAXMB=${MAXMB:-500}
+HOST=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo host)
+TS=$(date +%m%d-%H%M%S)
+BASE="$VAULT/baseline_$HOST.txt"
+NOTES="$VAULT/notes.txt"
+SCRIPT=''
+[ -f "$0" ] && SCRIPT=$(readlink -f "$0" 2>/dev/null)
+LC_ALL=C
+export LC_ALL
+
+# Game-day settings saved in the vault (root only): your networks and the bait.
+if [ -z "$OURNETS" ] && [ -s "$VAULT/ournets.txt" ]; then OURNETS=$(cat "$VAULT/ournets.txt" 2>/dev/null); fi
+BAIT='' BAITUSER=''
+if [ -s "$VAULT/bait.txt" ]; then read -r BAIT BAITUSER _ < "$VAULT/bait.txt" 2>/dev/null; fi
+
+say() { printf '%s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+tmo() { if have timeout; then timeout 10 "$@"; else "$@"; fi; }
+now_utc() { date -u '+%Y-%m-%d %H:%M UTC'; }
+
+# Everything this script prints goes through this filter. Red team can put hidden
+# characters in file names, process names and log lines: a carriage return can make
+# "curl evil | sh" look like a harmless comment, and escape codes can rewrite the
+# screen. Here every hidden or non-English character shows as a ?.
+sanitize() { sed 's/[^[:print:][:blank:]]/?/g'; }
+
+# A short fingerprint of a file, like 3f9a-21c0-77de. Write the baseline's seal on
+# paper. If it ever changes, someone edited the baseline to hide what they did.
+seal() {
+    if have sha256sum; then h=$(sha256sum "$1" 2>/dev/null | cut -c1-12)
+    else h=$(cksum "$1" 2>/dev/null | awk '{print $1}'); fi
+    printf '%s\n' "$h" | sed 's/^\(....\)\(....\)\(....\)$/\1-\2-\3/'
+}
+
+# Did an installed package put this file here? 0 = yes, 1 = no, 2 = cannot tell.
+# Red team's fake services and libraries came from no package at all.
+PKGLIST=''
+from_package() {
+    if [ -z "$PKGLIST" ]; then
+        PKGLIST="$VAULT/.pkgfiles.$$"
+        if [ -d /var/lib/dpkg/info ]; then cat /var/lib/dpkg/info/*.list > "$PKGLIST" 2>/dev/null
+        elif have rpm; then rpm -qal > "$PKGLIST" 2>/dev/null
+        else : > "$PKGLIST"; fi
+    fi
+    [ -s "$PKGLIST" ] || return 2
+    case "$1" in /snap/*|/var/lib/snapd/*|/var/lib/flatpak/*) return 0 ;; esac
+    fp_r=$(readlink -f "$1" 2>/dev/null)
+    [ -n "$fp_r" ] || fp_r=$1
+    for fp_c in "$1" "$fp_r" "${fp_r#/usr}" "/usr$fp_r"; do
+        grep -F -x -q -- "$fp_c" "$PKGLIST" && return 0
+    done
+    return 1
+}
+
+# The package that owns a file, and the command that puts a missing file back.
+pkg_owner() {
+    po_n=''
+    if have dpkg; then
+        for po_c in "$1" "${1#/usr}" "/usr$1"; do
+            po_n=$(dpkg -S "$po_c" 2>/dev/null | grep -v '^diversion' | head -1 | cut -d: -f1)
+            [ -n "$po_n" ] && break
+        done
+    elif have rpm; then
+        po_n=$(rpm -qf --qf '%{NAME}\n' "$1" 2>/dev/null | grep -v 'not owned' | head -1)
+    fi
+    [ -n "$po_n" ] && say "$po_n"
+}
+reinstall_cmd() {
+    rc_n=$(pkg_owner "$1")
+    [ -n "$rc_n" ] || return 1
+    if have apt-get; then say "apt-get install --reinstall $rc_n"
+    elif have dnf; then say "dnf reinstall $rc_n"
+    elif have yum; then say "yum reinstall $rc_n"
+    else say "reinstall the $rc_n package"; fi
+}
+
+need_root() {
+    if [ "$(id -u)" != "0" ]; then
+        say "Run this as root. Use: sudo sh first30.sh   (or su - first)"
+        exit 1
+    fi
+    umask 077
+    if [ -L "$VAULT" ]; then
+        say "$VAULT is a link to somewhere else. Someone set a trap: tell your lead, and use VAULT=/other/dir."
+        exit 1
+    fi
+    mkdir -p "$VAULT" && chmod 700 "$VAULT"
+    trap 'rm -f "$VAULT/.pkgfiles.$$" "$VAULT/.c2samples.$$" "$VAULT/.ptab.$$" "$VAULT/.stamp_new.$$" "$VAULT/.trace.$$"' 0
+    trap 'exit 1' INT TERM
+}
+
+# A line in the team notes, written by this script when it changes something, so
+# the team's own changes are easy to tell apart from red team's in the hunt.
+autonote() {
+    [ -d "$VAULT" ] || return 0
+    printf '%s  %s  first30: %s\n' "$(now_utc)" "$HOST" "$*" >> "$NOTES"
+    chmod 600 "$NOTES" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- output helpers
+# Every check starts with sec. flag marks the check as "something to look at" for
+# the summary at the end. nxt prints what to do about it.
+FOUND='' NFOUND=0 CUR=''
+sec() {
+    CUR=$2
+    say ""
+    say "== $2"
+    [ -n "$LEARN" ] && learn "$1"
+}
+flag() {
+    case "$FOUND" in *"|$CUR|"*) return 0 ;; esac
+    FOUND="$FOUND|$CUR|"
+    NFOUND=$((NFOUND + 1))
+}
+ok() { say "  ok: $*"; }
+nxt() { say "  Next: $*"; }
+
+# Learn mode: the plain command you can type yourself, and why the check matters.
+learn() {
+    l_c='' l_w=''
+    case "$1" in
+        self) l_c='cat /etc/ld.so.preload   (should be missing or empty)    and    ldd /bin/true'
+              l_w='a library listed there loads into every program, this script'"'"'s tools too, and can hide things from them.' ;;
+        last) l_c='ls -t /root/bk   (snapshots, newest first)    then    diff <older snapshot> <newer snapshot>'
+              l_w='shows only the newest changes, so what red team did 10 minutes ago is not buried under the morning.' ;;
+        files) l_c='find /etc /root /home -cmin -30 -type f   (files changed in the last 30 minutes)'
+               l_w='-cmin uses the change time the kernel keeps. touch can fake the modified time, not this one.' ;;
+        base) l_c='diff /root/bk/baseline_<host>.txt <newest snapshot>'
+              l_w='everything that changed since the start of the game. Long by now; read part 1 first.' ;;
+        rat) l_c='ps -ef    and    systemctl list-units --type=service    (look for mesh, anydesk, rustdesk, vnc)'
+             l_w='a remote-access tool is a way back in that survives password changes. It was the way in at the invitational.' ;;
+        web) l_c='grep -r -l "shell_exec(" /var/www'
+             l_w='a web shell runs any command typed into a web page, as the web server'"'"'s account.' ;;
+        temp) l_c='ls -la /tmp /var/tmp /dev/shm'
+              l_w='droppers and agents land here, often with a dot in front of the name so plain ls hides them.' ;;
+        exe) l_c='ls -l /proc/<pid>/exe   (the program file a process runs)'
+             l_w='an agent whose file is deleted, or sits in /tmp, is hiding. The imix agent ran as /tmp/.sysupd.bin.' ;;
+        procs) l_c='ls -l /proc/<pid>/exe    then    dpkg -S <that path>    (Red Hat: rpm -qf <that path>)'
+               l_w='the system'"'"'s programs come from packages. A program from no package was put there by a person.' ;;
+        svc) l_c='systemctl cat <service>    then    dpkg -S <its program>    (Red Hat: rpm -qf)'
+             l_w='red team gave fake services normal names. Where the program came from gives them away.' ;;
+        kthread) l_c='ps -ef   (real kernel threads are in [brackets] and ls -l /proc/<pid>/exe shows no file)'
+                 l_w='naming a program [kworker] makes people skip over it.' ;;
+        shells) l_c='ls -l /proc/<pid>/fd   (0 and 1 pointing to socket:[...] = its keyboard and screen are the network)'
+                l_w='that is what a reverse shell or a bind shell looks like from the inside.' ;;
+        sniff) l_c='cat /proc/net/packet   (every program reading raw traffic; the last column is its socket number)'
+               l_w='a backdoor that reads raw packets (like BPFDoor) opens no port, so ss -l and port scans never show it.' ;;
+        rootkit) l_c='ls /proc  vs  ps -e,    ss -tln  vs  cat /proc/net/tcp,    lsmod  vs  ls /sys/module'
+                 l_w='a rootkit can fool one way of looking, rarely all of them. When two views disagree, something hides.' ;;
+        pam) l_c='grep -r pam_exec /etc/pam.d'
+             l_w='PAM decides who may log in. One added line can run a password stealer or let anyone in.' ;;
+        pkg) l_c='dpkg --verify openssh-server    (Red Hat: rpm -V openssh-server; no output = every file matches)'
+             l_w='a swapped sshd, pam_deny.so or ps looks just like the real one, except for its checksum.' ;;
+        preload) l_c='grep -r LD_PRELOAD /etc/systemd /etc/environment'
+                 l_w='LD_PRELOAD loads a library into a program first. That is how a library got into sshd at the invitational.' ;;
+        sudo) l_c='cat /etc/sudoers    and    ls /etc/sudoers.d'
+              l_w='one file in sudoers.d gave every domain user root at the invitational.' ;;
+        accounts) l_c='cat /etc/passwd   (3rd field 0 = root power; the last field is the shell)'
+                  l_w='an extra UID 0 account, or a service account with a shell, is a quiet way back in.' ;;
+        keys) l_c='cat /root/.ssh/authorized_keys    and    sshd -T | grep -i authorizedkeys'
+              l_w='a planted key logs in with no password, even after every password is changed.' ;;
+        sshd) l_c='sshd -T   (the settings sshd really uses, after every include file)'
+              l_w='one setting can let anyone in (empty passwords) or trust red team'"'"'s key for every account.' ;;
+        logins) l_c='who    and    last -a | head    and    grep Accepted /var/log/auth.log   (Red Hat: /var/log/secure)'
+                l_w='red team logs in with real accounts (T1078). Know who is on your box, and from where.' ;;
+        jobs) l_c='crontab -l    ls /etc/cron.d    atq    systemctl list-timers'
+              l_w='a scheduled job brings a backdoor back after you remove it.' ;;
+        shellinit) l_c='cat /root/.bashrc    and    type sudo   (type tells you if sudo is really an alias or a function)'
+                   l_w='an alias or function named sudo can steal your password while you type it.' ;;
+        tamper) l_c='lsattr /etc/passwd   (an i means locked; chattr -i <file> unlocks it)'
+                l_w='red team locks their backdoor files, and sometimes yours, so even root cannot change them.' ;;
+        logs) l_c='ls -l /var/log    and    ls -l /root/.bash_history   (-> /dev/null means history is thrown away)'
+              l_w='cleared logs hide what happened (T1070). A log that got smaller since the last hunt was cut.' ;;
+        c2) l_c='ss -tnp   (each line: the program, and the address it is talking to)'
+            l_w='an agent has to call home. A program that keeps calling the same outside address is the one to check.' ;;
+        ci) l_c='ps -ef | grep -i runner    and    docker ps'
+            l_w='a CI runner runs whatever the repo tells it to. A host-level container is root on this box.' ;;
+        ransom) l_c='find /home /var/www -name "*.locked"'
+                l_w='locked files and ransom notes (T1486) mean you need your backups now.' ;;
+        bait) l_c='ausearch -k bait -i'
+              l_w='nobody on your team opens the bait. If someone did, it was red team, and the log says who.' ;;
+        spam) l_c='ls -l /usr/bin/wall /usr/bin/write   (---------- = turned off)    and    grep TracerPid /proc/<pid>/status'
+              l_w='wall and write flood every terminal. A program tracing your shell, or reading /dev/vcs, sees what you type.' ;;
+        audit) l_c='auditctl -s   (enabled 2 = locked)    and    ausearch -k identity -i'
+               l_w='red team took over auditd at the invitational. If it is off or unlocked, they can blind you.' ;;
+        *) return 0 ;;
+    esac
+    say "  [learn] by hand: $l_c"
+    say "  [learn] why: $l_w"
+}
+
+# Plain names for the tags in the snapshot files, used when showing changes.
+TAGMAP='PASSWD=account|UID0=root-level account|NOPASSWORD=no-password account|GROUP=admin group|SUDO=sudo rule|KEYS=SSH key file|CRON=cron job|AUTOSTART=autostart script|BOOTSCRIPT=boot script line|ENABLED=starts at boot|TIMER=timer|UNITFILE=service file|LISTEN=open port|SUID=SUID program|PRELOAD=ld.so.preload|PAM=PAM line|PROFILE=shell startup file|HOSTS=hosts file|SSHCONF=SSH config file|SSHD=SSH setting|MODULE=kernel module|DROPIN=service drop-in|UNITENV=service environment|ENVFILE=/etc/environment|CAPS=file capability|PAMMOD=PAM module file|LOCKED=locked file|RUNNING=running service|FW=firewall rule|FWNAT=firewall NAT rule|FWSTATE=firewall on/off|NFT=nftables rules|AUDITCFG=auditd file|AUDITSTATE=auditd on/off|PKG=package|PKGDB=package database|SWITCH=security switch|TAINT=kernel taint|NET=network setting|PASSWORD=password|ATJOB=at job|USERUNIT=user service|LINGER=user services at boot|BPF=eBPF program owner|BPFPIN=pinned eBPF|INETD=inetd service|WRAPPER=hosts.allow/deny'
+
+show_diff() {   # $1 = NEW or GONE, $2 = snapshot lines
+    printf '%s\n' "$2" | awk -v kind="$1" -v map="$TAGMAP" '
+        BEGIN { n = split(map, m, "|"); for (i = 1; i <= n; i++) { j = index(m[i], "="); t[substr(m[i], 1, j - 1)] = substr(m[i], j + 1) } }
+        NF { tag = $1; rest = substr($0, length($1) + 2); name = (tag in t) ? t[tag] : tag
+             printf "  %-4s %-21s %s\n", kind, name, rest }'
+}
+
+count_by_tag() {   # one line like: open port 2, package 5
+    printf '%s\n' "$1" | awk -v map="$TAGMAP" '
+        BEGIN { n = split(map, m, "|"); for (i = 1; i <= n; i++) { j = index(m[i], "="); t[substr(m[i], 1, j - 1)] = substr(m[i], j + 1) } }
+        NF { c[$1]++ }
+        END { s = ""; for (k in c) s = s (s == "" ? "" : ", ") ((k in t) ? t[k] : k) " " c[k]; print s }'
+}
+
+# ---------------------------------------------------------------- process table
+# One pass over /proc: "PID PROGRAM" for every process that has a program file.
+# Kernel threads have none. Read once per run, used by several checks.
+PTAB=''
+proc_table() {
+    PTAB="$VAULT/.ptab.$$"
+    ls -l /proc/[0-9]*/exe 2>/dev/null | awk '{
+        i = index($0, " /proc/"); if (!i) next
+        r = substr($0, i + 7); p = r; sub(/\/.*/, "", p)
+        j = index(r, " -> "); if (!j) next
+        print p, substr(r, j + 4) }' > "$PTAB"
+}
+
+# PIDs that live in the same filesystem view as PID 1 (so not inside a container)
+host_pids() {
+    m1=$(readlink /proc/1/ns/mnt 2>/dev/null)
+    ls -l /proc/[0-9]*/ns/mnt 2>/dev/null | awk -v m="$m1" '{
+        i = index($0, " /proc/"); if (!i) next
+        r = substr($0, i + 7); p = r; sub(/\/.*/, "", p)
+        if (index(r, " -> " m)) print p }'
+}
+
+# ---------------------------------------------------------------- package checks
+TOOL_PKGS='coreutils findutils grep sed gawk mawk dash bash procps iproute2 net-tools util-linux libc-bin kmod e2fsprogs'
+SEC_PKGS='libpam-modules libpam-modules-bin libpam-runtime libpam0g openssh-server openssh-client sudo login passwd auditd systemd cron rsyslog'
+RPM_TOOL_PKGS='coreutils findutils grep sed gawk bash procps-ng iproute net-tools util-linux glibc kmod e2fsprogs'
+RPM_SEC_PKGS='pam openssh-server openssh-clients sudo shadow-utils audit systemd cronie rsyslog'
+
+# Copy the checksum lists of the important packages into the vault at the baseline.
+# Later checks use these copies, so editing the package database cannot hide a
+# swapped program file.
+save_md5sums() {
+    have dpkg || return 0
+    sm_d="$VAULT/md5sums_$HOST"
+    mkdir -p "$sm_d"
+    for sm_p in $TOOL_PKGS $SEC_PKGS; do
+        sm_f=/var/lib/dpkg/info/$sm_p.md5sums
+        [ -f "$sm_f" ] || sm_f=$(ls /var/lib/dpkg/info/"$sm_p":*.md5sums 2>/dev/null | head -1)
+        [ -n "$sm_f" ] && [ -f "$sm_f" ] || continue
+        cp "$sm_f" "$sm_d/$sm_p.md5sums"
+        dpkg-query -W -f='${Version}' "$sm_p" > "$sm_d/$sm_p.version" 2>/dev/null
+    done
+    chmod -R go-rwx "$sm_d"
+}
+
+# Prints CHANGED / MISSING / CONFIG / PERMS lines for files that no longer match.
+verify_pkgs() {
+    if have dpkg; then
+        for vp_p in "$@"; do
+            vp_v=$(dpkg-query -W -f='${Status} ${Version}\n' "$vp_p" 2>/dev/null)
+            case "$vp_v" in *'ok installed'*) ;; *) continue ;; esac
+            vp_s="$VAULT/md5sums_$HOST/$vp_p.md5sums"
+            if [ -s "$vp_s" ] && [ "${vp_v##* }" = "$(cat "$VAULT/md5sums_$HOST/$vp_p.version" 2>/dev/null)" ]; then
+                (cd / && md5sum -c "$vp_s" 2>/dev/null) | awk '
+                    /: OK$/ {next}
+                    /: FAILED open or read$/ {sub(/: FAILED open or read$/, ""); print "MISSING: /" $0; next}
+                    /: FAILED$/ {sub(/: FAILED$/, ""); print "CHANGED: /" $0}'
+            else
+                dpkg --verify "$vp_p" 2>/dev/null | awk '
+                    $1 == "missing" {print "MISSING: " $NF; next}
+                    $2 == "c" {print "CONFIG: " $NF; next}
+                    {print "CHANGED: " $NF}'
+            fi
+        done
+    elif have rpm; then
+        rpm -V "$@" 2>/dev/null | grep -v 'is not installed' | awk '
+            $1 == "missing" {print "MISSING: " $NF; next}
+            $2 == "c" {print "CONFIG: " $NF; next}
+            $1 ~ /[5S]/ {print "CHANGED: " $NF; next}
+            $1 ~ /[MUG]/ {print "PERMS: " $NF}'
+    fi | grep -v -E ' /usr/share/(doc|man|locale|info|lintian|help)/' |
+        awk -v q="$QUIET_UNDO" 'BEGIN {while ((getline l < q) > 0) {split(l, a, " "); skip["PERMS: " a[2]] = 1}} !($0 in skip)'
+}
+
+# ---------------------------------------------------------------- snapshot
+# Things that should not change during the day. hunt compares these to the last
+# hunt and to the baseline. Every line starts with a tag so a change is easy to read.
+find_sshd() {
+    for s in "$(command -v sshd 2>/dev/null)" /usr/sbin/sshd /usr/local/sbin/sshd /run/current-system/sw/bin/sshd; do
+        if [ -n "$s" ] && [ -x "$s" ]; then echo "$s"; return 0; fi
+    done
+    return 1
+}
+
+# Files with the immutable (i) or append-only (a) attribute. Red team locks their
+# backdoors with chattr +i so nobody, not even root, can edit or delete them.
+locked_files() {
+    have lsattr || return 0
+    { find /etc /root/.ssh /var/spool/cron /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin \
+          /lib/systemd/system /usr/lib/systemd/system -xdev \( -type f -o -type d \) -print0 2>/dev/null
+      find /root /home /opt /srv /var/www -maxdepth 3 -xdev \
+          \( -path "$VAULT" -o -path "${BAIT:-/nonexistent}" -o -path '/home/*/.cache' \) -prune -o \
+          \( -type f -o -type d \) -print0 2>/dev/null
+    } | xargs -0 lsattr -d 2>/dev/null |
+        awk '$1 ~ /^[-a-zA-Z]+$/ && $1 ~ /[ia]/ {a = $1; $1 = ""; sub(/^ /, ""); print a, $0}' | sort -u
+}
+
+snapshot() {
+    # the time makes every snapshot's seal different; lines starting with # are not compared
+    say "# first30 snapshot of $HOST at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    sed 's/^/PASSWD /' /etc/passwd
+    awk -F: '$3==0 {print "UID0 " $1}' /etc/passwd
+    if [ -r /etc/shadow ]; then
+        awk -F: '$2=="" {print "NOPASSWORD " $1}' /etc/shadow
+        # a short fingerprint of each password hash: shows any password change, and a
+        # locked account that suddenly has a password
+        awk -F: '{print $1, $2}' /etc/shadow | while read -r su sh; do
+            say "PASSWORD $su $(printf '%s' "$sh" | sha256sum | cut -c1-8)"
+        done
+    fi
+    for g in root sudo wheel admin adm docker lxd disk shadow; do
+        grep "^$g:" /etc/group 2>/dev/null | sed 's/^/GROUP /'
+    done
+    for f in /etc/sudoers /etc/sudoers.d/*; do
+        [ -f "$f" ] || continue
+        grep -v '^[[:space:]]*$' "$f" | grep -v '^[[:space:]]*#[^i@]' | sed "s|^|SUDO $f: |"
+    done
+    # Key files in every account's home, plus /etc/ssh. No full-disk search, so a dead
+    # NFS mount cannot hang it.
+    awk -F: '{print $6}' /etc/passwd | sort -u | while read -r h; do
+        for f in "$h"/.ssh/authorized_keys*; do
+            [ -f "$f" ] && say "KEYS $(sha256sum "$f" 2>/dev/null | cut -c1-16) $f"
+        done
+    done
+    find /etc/ssh -name 'authorized_keys*' -type f 2>/dev/null | while read -r f; do
+        say "KEYS $(sha256sum "$f" 2>/dev/null | cut -c1-16) $f"
+    done
+    for f in /etc/crontab /etc/anacrontab /etc/cron.d/* /var/spool/cron/* /var/spool/cron/crontabs/*; do
+        [ -f "$f" ] || continue
+        grep -v '^[[:space:]]*$' "$f" | grep -v '^[[:space:]]*#' | sed "s|^|CRON $f: |"
+    done
+    for d in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /etc/init.d; do
+        [ -d "$d" ] && ls -1 "$d" 2>/dev/null | sed "s|^|AUTOSTART $d/|"
+    done
+    for f in /etc/rc.local /opt/bootlocal.sh /opt/bootsync.sh; do
+        [ -f "$f" ] && grep -v '^[[:space:]]*$' "$f" | grep -v '^[[:space:]]*#' | sed "s|^|BOOTSCRIPT $f: |"
+    done
+    for d in /var/spool/cron/atjobs /var/spool/at; do
+        [ -d "$d" ] && ls -1 "$d" 2>/dev/null | grep -v -E '^(\.SEQ|spool)$' | sed "s|^|ATJOB $d/|"
+    done
+    if have systemctl; then
+        systemctl list-unit-files --state=enabled --no-legend 2>/dev/null | awk '{print "ENABLED " $1}'
+        systemctl list-timers --all --no-legend 2>/dev/null |
+            awk '{for (i = 1; i <= NF; i++) if ($i ~ /\.timer$/) print "TIMER " $i}'
+        for d in /etc/systemd/system /usr/local/lib/systemd/system; do
+            [ -d "$d" ] || continue
+            find "$d" -type f \( -name '*.service' -o -name '*.timer' \) 2>/dev/null | while read -r f; do
+                say "UNITFILE $(sha256sum "$f" | cut -c1-16) $f"
+            done
+        done
+        # user-level services start without root's crontab or /etc/systemd; with
+        # "linger" they start at boot even when nobody is logged in
+        for d in /etc/systemd/user /root/.config/systemd/user /home/*/.config/systemd/user; do
+            [ -d "$d" ] || continue
+            find "$d" \( -name '*.service' -o -name '*.timer' \) 2>/dev/null | while read -r f; do
+                say "USERUNIT $(sha256sum "$f" 2>/dev/null | cut -c1-16) $f"
+            done
+        done
+        [ -d /var/lib/systemd/linger ] && ls -1 /var/lib/systemd/linger 2>/dev/null | sed 's/^/LINGER /'
+    fi
+    [ -f /etc/inetd.conf ] && grep -v -E '^[[:space:]]*(#|$)' /etc/inetd.conf | sed 's/^/INETD /'
+    [ -d /etc/xinetd.d ] && grep -l -i -E 'disable[[:space:]]*=[[:space:]]*no' /etc/xinetd.d/* 2>/dev/null | sed 's/^/INETD on: /'
+    for f in /etc/hosts.allow /etc/hosts.deny; do
+        [ -f "$f" ] && grep -v -E '^[[:space:]]*(#|$)' "$f" | sed "s|^|WRAPPER $f: |"
+    done
+    if have ss; then
+        ss -tuln 2>/dev/null | awk 'NR > 1 {print "LISTEN " $1 " " $5}'
+    elif have netstat; then
+        netstat -tuln 2>/dev/null | awk '$1 ~ /^(tcp|udp)/ {print "LISTEN " $1 " " $4}'
+    fi
+    find / -xdev -perm -4000 -type f 2>/dev/null | sed 's/^/SUID /'
+    [ -f /etc/ld.so.preload ] && sed 's/^/PRELOAD /' /etc/ld.so.preload
+    grep -r -E 'pam_permit|pam_exec' /etc/pam.d 2>/dev/null | sed 's/^/PAM /'
+    for f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/profile.d/* /root/.bashrc /root/.profile /root/.bash_profile; do
+        [ -f "$f" ] && say "PROFILE $(sha256sum "$f" | cut -c1-16) $f"
+    done
+    grep -v '^[[:space:]]*$' /etc/hosts 2>/dev/null | grep -v '^[[:space:]]*#' | sed 's/^/HOSTS /'
+    for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* /usr/local/etc/ssh/sshd_config; do
+        [ -f "$f" ] && say "SSHCONF $(sha256sum "$f" | cut -c1-16) $f"
+    done
+    sshd_bin=$(find_sshd) && "$sshd_bin" -T 2>/dev/null |
+        grep -i -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|authorizedkeysfile|authorizedkeyscommand|trustedusercakeys|permitemptypasswords|permituserenvironment) ' |
+        sed 's/^/SSHD /'
+    have lsmod && lsmod 2>/dev/null | awk 'NR > 1 {print "MODULE " $1}'
+    say "TAINT $(cat /proc/sys/kernel/tainted 2>/dev/null)"
+    # systemd drop-in overrides (a *.service.d/*.conf can inject LD_PRELOAD without
+    # touching the main unit, which is how the marvin backdoor hid at the invitational)
+    if have systemctl; then
+        for d in /etc/systemd/system /usr/local/lib/systemd/system /run/systemd/system; do
+            [ -d "$d" ] || continue
+            find "$d" -type f -name '*.conf' 2>/dev/null | while read -r f; do
+                say "DROPIN $(sha256sum "$f" | cut -c1-16) $f"
+            done
+        done
+        grep -r -I -E 'LD_PRELOAD|Environment=|EnvironmentFile=' /etc/systemd/system /run/systemd/system 2>/dev/null | sed 's/^/UNITENV /'
+    fi
+    [ -f /etc/environment ] && grep -v '^[[:space:]]*$' /etc/environment 2>/dev/null | sed 's/^/ENVFILE /'
+    # file capabilities: a modern privesc/backdoor path the SUID scan does not see
+    have getcap && find /usr /bin /sbin /opt /home /etc -xdev ! -path "${BAIT:-/nonexistent}" -type f \
+        -exec getcap {} + 2>/dev/null | sed 's/^/CAPS /'
+    # PAM modules on disk, so a swapped pam_unix.so or a planted pam_*.so shows by hash
+    for d in /lib/security /lib64/security /usr/lib/security /usr/lib/x86_64-linux-gnu/security /usr/lib64/security; do
+        [ -d "$d" ] || continue
+        find "$d" -name '*.so' 2>/dev/null | while read -r f; do
+            say "PAMMOD $(sha256sum "$f" | cut -c1-16) $f"
+        done
+    done
+    locked_files | sed 's/^/LOCKED /'
+    # running services, so a stopped scored service shows up as GONE (T1489)
+    if have systemctl; then
+        systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null |
+            awk '{print $1}' |
+            grep -v -E '^(user@|run-|systemd-(hostnamed|localed|timedated)|packagekit|fwupd)' |
+            sed 's/^/RUNNING /'
+    fi
+    # the firewall, so a deleted rule, a NAT redirect or a turned-off firewall shows (T1562.004)
+    if have iptables; then
+        iptables -S INPUT 2>/dev/null | sed 's/^/FW /'
+        iptables -S OUTPUT 2>/dev/null | sed 's/^/FW /'
+        iptables -t nat -S 2>/dev/null | grep -E '^-A' | sed 's/^/FWNAT /'
+    fi
+    have nft && say "NFT $(nft -s list ruleset 2>/dev/null | sha256sum | cut -c1-16)"
+    have firewall-cmd && say "FWSTATE firewalld $(firewall-cmd --state 2>&1 | head -1)"
+    have ufw && say "FWSTATE ufw $(ufw status 2>/dev/null | head -1)"
+    # auditd's own files and its on/off state (T1562.001)
+    for f in /etc/audit/auditd.conf /etc/audit/audit.rules /etc/audit/rules.d/* /etc/audit/plugins.d/* \
+        /etc/audisp/audispd.conf /etc/audisp/plugins.d/*; do
+        [ -f "$f" ] && say "AUDITCFG $(sha256sum "$f" | cut -c1-16) $f"
+    done
+    have auditctl && say "AUDITSTATE enabled=$(audit_enabled)"
+    # security switches red team turns off (T1562.001)
+    have getenforce && say "SWITCH selinux=$(getenforce 2>/dev/null)"
+    [ -r /sys/module/apparmor/parameters/enabled ] && say "SWITCH apparmor=$(cat /sys/module/apparmor/parameters/enabled)"
+    for s in kernel/randomize_va_space kernel/yama/ptrace_scope fs/suid_dumpable net/ipv4/ip_forward \
+        kernel/modules_disabled kernel/kptr_restrict kernel/dmesg_restrict kernel/unprivileged_bpf_disabled; do
+        [ -r "/proc/sys/$s" ] && say "SWITCH $s=$(cat "/proc/sys/$s")"
+    done
+    # how this box finds other machines: DNS servers and name lookup order (T1557, T1565)
+    awk '/^nameserver/ {print "NET dns " $2}' /etc/resolv.conf 2>/dev/null
+    grep '^hosts:' /etc/nsswitch.conf 2>/dev/null | sed 's/^/NET nsswitch /'
+    # eBPF: programs loaded into the kernel. Modern rootkits use them (T1014).
+    find /proc/[0-9]*/fdinfo -maxdepth 1 -type f -exec grep -l '^prog_type:' {} + 2>/dev/null |
+        cut -d/ -f3 | sort -u | while read -r bp; do cat "/proc/$bp/comm" 2>/dev/null; done | sort -u | sed 's/^/BPF /'
+    [ -d /sys/fs/bpf ] && find /sys/fs/bpf -mindepth 1 2>/dev/null | sed 's/^/BPFPIN /'
+    # packages, and a fingerprint of the package database itself
+    if have dpkg-query; then
+        dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 2>/dev/null | awk '$1 ~ /^ii/ {print "PKG " $2 " " $3}'
+        say "PKGDB lists=$(cat /var/lib/dpkg/info/*.list 2>/dev/null | sha256sum | cut -c1-12) sums=$(cat /var/lib/dpkg/info/*.md5sums 2>/dev/null | sha256sum | cut -c1-12)"
+    elif have rpm; then
+        rpm -qa --qf 'PKG %{NAME} %{VERSION}-%{RELEASE}\n' 2>/dev/null | sort
+    fi
+}
+
+# ---------------------------------------------------------------- listening ports
+# Every listening port with the program behind it and the account it runs as.
+# A port owned by a normal login account (UID 1000+) is marked, because that is
+# what a bind shell or a planted tool usually looks like.
+listen_accounts() {
+    printf '  %-5s %-28s %-16s %-7s %-12s %s\n' PROTO 'ADDRESS:PORT' PROGRAM PID ACCOUNT UNIT
+    if have ss; then
+        ss -tulnp 2>/dev/null | sed 1d | awk '{print $1, $5, $NF}'
+    elif have netstat; then
+        netstat -tulnp 2>/dev/null | awk '$1 ~ /^(tcp|udp)/ {print $1, $4, $NF}'
+    fi | sort -u | while read -r proto addr owner; do
+        pid=$(printf '%s\n' "$owner" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p')
+        prog=$(printf '%s\n' "$owner" | sed -n 's/.*(("\([^"]*\)".*/\1/p')
+        if [ -z "$pid" ]; then
+            case "$owner" in [0-9]*/*) pid=${owner%%/*}; prog=${owner#*/} ;; esac
+        fi
+        acct='' uid='' unit=''
+        if [ -n "$pid" ]; then
+            acct=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+            uid=$(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ')
+            unit=$(ps -o unit= -p "$pid" 2>/dev/null | tr -d ' ')
+        fi
+        mark=''
+        if [ -n "$uid" ] && [ "$uid" -ge 1000 ] 2>/dev/null && [ "$uid" -ne 65534 ]; then
+            mark='  <- login account, check this'
+        fi
+        printf '  %-5s %-28s %-16s %-7s %-12s %s%s\n' "$proto" "$addr" "${prog:--}" "${pid:--}" "${acct:-?}" "${unit:--}" "$mark"
+    done
+}
+
+# ---------------------------------------------------------------- info
+# Things that change all the time. Saved for the record, never compared.
+info() {
+    say "== $HOST at $(date)"
+    uname -a
+    grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release 2>/dev/null
+    say "== Addresses"
+    ip -br a 2>/dev/null || ifconfig 2>/dev/null
+    say "== Routes"
+    ip route 2>/dev/null || route -n 2>/dev/null
+    say "== Neighbors (ARP)"
+    ip neigh 2>/dev/null || arp -an 2>/dev/null
+    say "== Listening, with programs"
+    ss -tulnp 2>/dev/null || netstat -tulnp 2>/dev/null
+    say "== Listening ports, program and account"
+    listen_accounts
+    say "== Established connections"
+    ss -tnp state established 2>/dev/null || netstat -tnp 2>/dev/null | grep ESTAB
+    say "== Top CPU"
+    if ps aux --sort=-%cpu >/dev/null 2>&1; then ps aux --sort=-%cpu | head -15; else ps 2>/dev/null | head -15; fi
+    say "== Firewall"
+    iptables-save 2>/dev/null
+    nft list ruleset 2>/dev/null
+    firewall-cmd --list-all-zones 2>/dev/null
+    ufw status verbose 2>/dev/null
+    say "== Containers"
+    kubectl get pods -A -o wide 2>/dev/null || k3s kubectl get pods -A -o wide 2>/dev/null
+    docker ps -a 2>/dev/null
+    crictl ps -a 2>/dev/null
+    if [ -f /opt/.filetool.lst ]; then
+        say "== Tiny Core persistence list (/opt/.filetool.lst)"
+        cat /opt/.filetool.lst
+    fi
+}
+
+packages() {
+    if have dpkg-query; then dpkg-query -W -f='${Package} ${Version}\n'
+    elif have rpm; then rpm -qa | sort
+    elif have pacman; then pacman -Q
+    elif have nixos-version; then nixos-version; nix-store -qR /run/current-system/sw 2>/dev/null
+    elif [ -d /usr/local/tce.installed ]; then ls /usr/local/tce.installed
+    fi
+}
+
+# ================================================================ the checks
+# Each check prints its own section. These run at every hunt and at recon. They do
+# not rely on the baseline: something planted BEFORE the baseline is part of it, and
+# a baseline diff would never flag it. All of them are read only.
+
+chk_self() {
+    sec self "Self-check: can this box fool this script? (T1574.006, T1014)"
+    sbad=0
+    if [ -s /etc/ld.so.preload ]; then
+        say "  /etc/ld.so.preload is NOT empty. Every program on this box loads:"
+        sed 's/^/    /' /etc/ld.so.preload
+        sbad=1
+    fi
+    # Ask the loader itself what a plain program loads. A preloaded library shows
+    # here even when it hides its own name from /etc/ld.so.preload.
+    sx=$(LD_TRACE_LOADED_OBJECTS=1 /bin/true 2>/dev/null |
+        awk '{p = ($2 == "=>") ? $3 : $1; if (p ~ /^\//) print p}' |
+        grep -v -E '/(ld-linux[^/]*|ld64[^/]*|libc\.so[^/]*|ld-musl[^/]*|libc\.musl[^/]*)$')
+    if [ -n "$sx" ]; then
+        say "  A plain program loads extra libraries (a rootkit trick):"
+        say "$sx" | sed 's/^/    /'
+        sbad=1
+    fi
+    # the tools this script itself uses: ps, ss, grep, sed, awk, find, sh...
+    if have dpkg; then st=$(verify_pkgs $TOOL_PKGS | grep -v '^CONFIG')
+    else st=$(verify_pkgs $RPM_TOOL_PKGS | grep -v '^CONFIG'); fi
+    if [ -n "$st" ]; then
+        say "  This script's own tools do not match their packages:"
+        say "$st" | sed 's/^/    /'
+        sbad=1
+    fi
+    sl=$(find "$VAULT" -type l 2>/dev/null)
+    if [ -n "$sl" ]; then
+        say "  Links inside the vault (someone could make this script write to the wrong file):"
+        say "$sl" | sed 's/^/    /'
+        sbad=1
+    fi
+    if [ "$sbad" = 1 ]; then
+        flag
+        nxt "tell your lead NOW. What this script shows below may be faked. Plan to restore or rebuild this box."
+    else
+        ok "no preloaded libraries, and ps, ss, grep, sed, awk and find match their packages"
+    fi
+}
+
+RAT_NAMES='meshagent meshcentral anydesk teamviewer rustdesk screenconnect connectwise atera splashtop logmein gotomypc dwagent dwservice supremo netsupport tightvnc x11vnc tigervnc vncserver ngrok chisel frpc frps gost rport ligolo imix sliver'
+RAT_PORTS='16990 16991 7070 5938 6568 8041 5900 4899 8040'
+
+chk_rat() {
+    sec rat "Remote-access tools (T1219: the MeshCentral agent was the way in at the invitational)"
+    rhit=0
+    rcomm=$(ps -eo pid=,user=,comm= 2>/dev/null)
+    rargs=$(ps -eo pid=,args= 2>/dev/null)
+    runits=''
+    have systemctl && runits=$(systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}')
+    for n in $RAT_NAMES; do
+        m=$(printf '%s\n' "$rcomm" | awk -v n="$n" 'tolower($3) ~ ("(^|[^a-z])" n) {print "    pid " $1 " (" $2 "): " $3}')
+        if [ -z "$m" ] && [ ${#n} -ge 6 ]; then
+            m=$(printf '%s\n' "$rargs" | awk -v n="$n" 'index(tolower($0), n) {print "    pid " $0}')
+        fi
+        [ -n "$m" ] && { say "  process matches '$n':"; say "$m"; rhit=1; }
+        u=$(printf '%s\n' "$runits" | grep -i -E "(^|[^a-z])$n")
+        # shellcheck disable=SC2086
+        [ -n "$u" ] && { say "  service matches '$n': $(printf '%s ' $u)"; rhit=1; }
+    done
+    for d in /usr/local/mesh* /opt/*mesh* /usr/local/mesh_services* /opt/anydesk* /etc/anydesk* \
+        /opt/teamviewer* /opt/rustdesk* /opt/*screenconnect* /opt/*connectwise* /opt/splashtop* \
+        /usr/bin/anydesk /usr/bin/rustdesk /usr/bin/ngrok /usr/local/bin/ngrok /usr/local/bin/chisel; do
+        [ -e "$d" ] && { say "  path present: $d"; rhit=1; }
+    done
+    if have ss; then
+        for p in $RAT_PORTS; do
+            ss -tuln 2>/dev/null | awk '{print $5}' | grep -E "[:.]$p\$" >/dev/null 2>&1 &&
+                { say "  listening on a known remote-access port: $p"; rhit=1; }
+        done
+    fi
+    if [ "$rhit" = 1 ]; then
+        flag
+        nxt "ask your team if anyone installed it. If not: save evidence (sh first30.sh evidence <program>),"
+        say "        then with your lead: systemctl disable --now <service>. Red team installed MeshCentral the day BEFORE."
+    else
+        ok "none found by name, folder or port"
+    fi
+}
+
+chk_web() {
+    sec web "Web shells (T1505.003: a page that runs commands)"
+    wroots=''
+    for r in /var/www /usr/share/nginx/html /srv/www /srv/http /opt/lampp/htdocs; do [ -d "$r" ] && wroots="$wroots $r"; done
+    if [ -z "$wroots" ]; then ok "no web root on this box"; return 0; fi
+    # Strong signs only: a command function fed straight from the web request, or
+    # from decoded text. Plain eval() alone is common in real apps.
+    # shellcheck disable=SC2086
+    ws=$(find $wroots -xdev -type f \( -name '*.php*' -o -name '*.phtml' -o -name '*.inc' -o -name '*.jsp*' \
+            -o -name '*.asp*' -o -name '*.cgi' -o -name '*.pl' -o -name '*.py' \) ! -path "${BAIT:-/nonexistent}" \
+            -exec grep -l -I -E '(eval|assert|system|shell_exec|passthru|proc_open|popen|pcntl_exec|exec)[[:space:]]*\([[:space:]]*(@?\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES)|base64_decode|gzinflate|str_rot13|gzuncompress)|`[[:space:]]*\$_(GET|POST|REQUEST)|preg_replace[[:space:]]*\(.*/e|Runtime\.getRuntime\(\)\.exec|ProcessBuilder|Process\.Start|cmd\.exe' {} + 2>/dev/null | head -40)
+    if [ -n "$ws" ]; then
+        say "  files with web-shell code (REVIEW, do not delete yet):"
+        say "$ws" | while read -r f; do say "    $f   (changed $(date -r "$f" '+%m-%d %H:%M' 2>/dev/null))"; done
+        flag
+        nxt "open each one and look. If it is a shell: sh first30.sh evidence <file>, then remove it and find how it got there."
+    else
+        ok "nothing that looks like a web shell in:$wroots"
+    fi
+}
+
+chk_temp() {
+    sec temp "Files in temp folders (a dropper spot; T1105, T1564.001)"
+    if find / -maxdepth 0 -printf '' >/dev/null 2>&1; then
+        tall=$(find /tmp /var/tmp /dev/shm -maxdepth 3 -xdev \( -type f -o -type d \) -printf '%T@ %p\n' 2>/dev/null |
+            sort -rn | cut -d' ' -f2-)
+    else
+        tall=$(find /tmp /var/tmp /dev/shm -maxdepth 3 -xdev \( -type f -o -type d \) 2>/dev/null)
+    fi
+    tall=$(printf '%s\n' "$tall" | grep -v -E '^/(tmp|var/tmp|dev/shm)$|^/tmp/(systemd-private-|\.X11-unix|\.ICE-unix|\.font-unix|\.XIM-unix|\.Test-unix|snap-private-tmp)|^/var/tmp/(systemd-private-|cloud-init)')
+    if [ -z "$tall" ]; then ok "temp folders are empty"; return 0; fi
+    # programs and hidden names first, so a long list cannot bury them
+    texe=$(printf '%s\n' "$tall" | while read -r f; do
+        [ -f "$f" ] || continue
+        m=''
+        [ -x "$f" ] && m="$m program"
+        case "${f##*/}" in .*) m="$m hidden" ;; esac
+        case "$f" in */.*/*) m="$m in-hidden-folder" ;; esac
+        [ -n "$m" ] && printf '    %s   [%s]\n' "$f" "${m# }"
+    done | head -30)
+    tcount=$(printf '%s\n' "$tall" | grep -c .)
+    if [ -n "$texe" ]; then
+        say "  programs and hidden files (check these first):"
+        say "$texe"
+        flag
+        nxt "look at each: ls -la <file>, then sh first30.sh evidence <file>. The imix agent was /tmp/.sysupd.bin."
+    fi
+    say "  $tcount items in /tmp, /var/tmp and /dev/shm in total. The newest:"
+    printf '%s\n' "$tall" | head -15 | sed 's/^/    /'
+    [ "$tcount" -gt 15 ] && say "    ... and $((tcount - 15)) older ones: ls -lat /tmp /var/tmp /dev/shm"
+}
+
+chk_exe() {
+    sec exe "Programs running from a deleted file, a temp folder or a hidden folder (T1070.004, T1564.001)"
+    xout=$(while read -r pid t; do
+        case "$t" in
+            *' (deleted)'|/tmp/*|/var/tmp/*|/dev/shm/*|*/.*) ;;
+            *) continue ;;
+        esac
+        printf '  pid %s (%s): %s\n' "$pid" "$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')" "$t"
+        f=${t% (deleted)}
+        case "$t" in
+            /memfd:*)
+                say "    it runs from memory only, with no file on disk at all (a fileless trick, T1620)."
+                say "    Copy it: sh first30.sh evidence /proc/$pid/exe" ;;
+            *' (deleted)')
+                if [ -e "$f" ]; then
+                    say "    the file was replaced while it ran (a package update does this). A restart is safe."
+                elif from_package "$f"; then
+                    say "    its file is GONE, so restarting it will FAIL. Put the file back first:"
+                    say "    $(reinstall_cmd "$f" || echo 'reinstall the package that owns it')"
+                    say "    (At the invitational, red team deleted sshd so SSH could not restart.)"
+                else
+                    say "    its file is gone and no package owns it. Copy it first: sh first30.sh evidence /proc/$pid/exe"
+                fi ;;
+        esac
+    done < "$PTAB")
+    if [ -n "$xout" ]; then
+        say "$xout"
+        flag
+        nxt "save a copy of the program while it still runs: sh first30.sh evidence /proc/<pid>/exe"
+    else
+        ok "none"
+    fi
+}
+
+chk_procs() {
+    sec procs "Running programs that no package installed (T1036.005, T1543)"
+    hp=" $(host_pids | tr '\n' ' ') "
+    pout=$(sort -k2 "$PTAB" | awk '{p = $1; $1 = ""; sub(/^ /, ""); sub(/ \(deleted\)$/, "")
+            if ($0 == last) {n++; next} if (last != "") print first, n, last; last = $0; first = p; n = 1}
+            END {if (last != "") print first, n, last}' |
+        while read -r pid n exe; do
+            case "$hp" in *" $pid "*) ;; *) continue ;; esac   # inside a container: not this box's files
+            from_package "$exe"
+            [ $? = 1 ] || continue
+            printf '  %s   (pid %s, account %s, %s running, file date %s)\n' "$exe" "$pid" \
+                "$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')" "$n" "$(date -r "$exe" '+%Y-%m-%d %H:%M' 2>/dev/null || echo gone)"
+        done)
+    if [ -n "$pout" ]; then
+        say "$pout"
+        say "  Some are real apps installed by hand (k3s, Vault, a CI runner). Check each one's date and what it is."
+        flag
+        nxt "for one you do not know: sh first30.sh evidence <program>, then ask your lead before stopping it."
+    else
+        ok "every running program came from a package"
+    fi
+}
+
+chk_svc() {
+    sec svc "Services running a program that no package installed (T1543.002, T1036.005)"
+    say "  Red team gave fake services normal names: dbus-resolver, kworker-gc, sshd-session."
+    if ! have systemctl || ! systemctl list-units --no-legend >/dev/null 2>&1; then ok "no systemd here"; return 0; fi
+    vout=$(set -f
+        { systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}'
+          systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | awk '{print $1}'
+        } | sort -u | while read -r u; do
+            case "$u" in *@.service|'') continue ;; esac
+            # shellcheck disable=SC2046
+            set -- $(systemctl show -p ExecStart "$u" 2>/dev/null | sed -n 's/.*argv\[\]=\([^;]*\);.*/\1/p' | head -1)
+            [ "$#" -gt 0 ] || continue
+            prog=$1
+            # for a script run by sh, bash or python, check the script, not the interpreter
+            case "${prog##*/}" in
+                sh|bash|dash|python*|perl|ruby|node|php*|env)
+                    for a in "$@"; do
+                        case "$a" in /*) [ "$a" != "$prog" ] && [ -f "$a" ] && { prog=$a; break; } ;; esac
+                    done ;;
+            esac
+            from_package "$prog"
+            [ $? = 1 ] || continue
+            printf '  %s -> %s   (file date %s)\n' "$u" "$prog" "$(date -r "$prog" '+%Y-%m-%d %H:%M' 2>/dev/null || echo 'file missing')"
+        done)
+    if [ -n "$vout" ]; then
+        say "$vout"
+        say "  Some are real apps installed by hand (Vault, a CI runner). The MeshCentral agent was installed the day BEFORE."
+        flag
+        nxt "systemctl cat <service> to see it. If nobody knows it: evidence, then with your lead: systemctl disable --now <service>"
+    else
+        ok "every running or enabled service runs a program from a package"
+    fi
+}
+
+chk_kthread() {
+    sec kthread "Programs dressed up as kernel threads (T1036.004)"
+    kout=$(ps -eo pid=,comm=,args= 2>/dev/null | awk -v tab="$PTAB" '
+        BEGIN { while ((getline l < tab) > 0) { split(l, a, " "); exe[a[1]] = substr(l, length(a[1]) + 2) } }
+        { pid = $1; comm = $2; args = $0; sub(/^ *[0-9]+ +[^ ]+ +/, "", args)
+          if (!(pid in exe)) next     # real kernel threads have no program file
+          if (args ~ /^\[/ || comm ~ /^(kworker|ksoftirqd|kthreadd|kswapd|migration|rcu_|kauditd|khugepaged|jbd2)/)
+              printf "  pid %s shows as \"%s\" but runs %s\n", pid, args, exe[pid] }')
+    if [ -n "$kout" ]; then
+        say "$kout"
+        flag
+        nxt "real kernel threads have no program file. These do. sh first30.sh evidence /proc/<pid>/exe"
+    else
+        ok "none"
+    fi
+}
+
+chk_shells() {
+    sec shells "Shells wired to the network, and web servers starting shells (T1059.004, T1505.003)"
+    # a shell whose keyboard (0) or screen (1) is a network socket is a reverse or bind shell
+    sk=$(ls -l /proc/[0-9]*/fd/0 /proc/[0-9]*/fd/1 2>/dev/null | awk '/ -> socket:\[/ {
+            i = index($0, " /proc/"); r = substr($0, i + 7); sub(/\/.*/, "", r); print r}' | sort -u)
+    sout=''
+    for pid in $sk; do
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+        case "$comm" in
+            sh|bash|dash|zsh|ksh|ash|busybox|python*|perl*|ruby*|php*|lua*|nc|ncat|netcat|socat|telnet|script) ;;
+            *) continue ;;
+        esac
+        # skip this script's own shells (run over ssh, they can have a socket for input)
+        a=$pid i=0 mine=0
+        while [ "$i" -lt 12 ] && [ -n "$a" ] && [ "$a" != 1 ] && [ "$a" != 0 ]; do
+            [ "$a" = "$$" ] && { mine=1; break; }
+            a=$(awk '/^PPid:/ {print $2}' "/proc/$a/status" 2>/dev/null)
+            i=$((i + 1))
+        done
+        [ "$mine" = 1 ] && continue
+        pp=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+        sout="$sout
+  pid $pid ($comm, started by $(cat "/proc/$pp/comm" 2>/dev/null) pid $pp): $(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+    done
+    wout=$(ps -eo pid=,ppid=,comm=,args= 2>/dev/null | awk '
+        { c[$1] = $3; par[$1] = $2; line[$1] = $0 }
+        END { for (p in c) { q = c[par[p]]
+            if (c[p] ~ /^(sh|bash|dash|zsh|python[0-9.]*|perl|nc|ncat|socat|curl|wget|base64|whoami|id|uname)$/ &&
+                q ~ /^(apache2|httpd|nginx|php-fpm.*|php-cgi.*|lighttpd|caddy|java|tomcat.*|uwsgi|gunicorn)$/)
+                print "  pid " p " (" c[p] ") was started by the web server (" q "): " line[p] } }')
+    if [ -n "$sout$wout" ]; then
+        [ -n "$sout" ] && say "$sout" | sed '/^$/d'
+        [ -n "$wout" ] && say "$wout"
+        flag
+        nxt "note the pid and who started it. ss -tnp shows where it connects. Save evidence, then block the address."
+    else
+        ok "no shells talking straight to the network, and no web server running a shell right now"
+    fi
+}
+
+QUIET_UNDO="$VAULT/quiet_undo.txt"
+SPAM_PROGS='wall write talk ytalk'
+
+chk_spam() {
+    sec spam "Terminal spam and screen watching (wall, write, tracing, console readers; T1056, T1113)"
+    so=''
+    sp=$(ps -eo pid=,user=,tty=,comm= 2>/dev/null | awk '$4 ~ /^(wall|write|talk|ytalk|bsd-write|write\.ul)$/ {print "    pid " $1 " " $4 ", account " $2 ", from terminal " $3}')
+    [ -n "$sp" ] && so="$so
+  sending messages to terminals right now:
+$sp"
+    if [ -s "$QUIET_UNDO" ]; then
+        reopened=''
+        while read -r qm qf; do
+            cm=$(stat -c %a "$qf" 2>/dev/null) || continue
+            case "$qf" in
+                /dev/*) [ "$cm" = 600 ] || reopened=yes ;;
+                *) [ "$cm" = 0 ] || so="$so
+  $qf is turned back ON (mode $cm): someone undid your spam protection" ;;
+            esac
+        done < "$QUIET_UNDO"
+        [ -n "$reopened" ] && so="$so
+  console screens can be read by others again (a reboot resets /dev, or someone changed them): run quiet again"
+    fi
+    # a program traced by strace or gdb can have every keystroke and password read out of it
+    tr=$(grep -l -E '^TracerPid:[[:space:]]*[1-9]' /proc/[0-9]*/status 2>/dev/null | while read -r st; do
+            tp=$(awk '/^TracerPid:/ {print $2}' "$st" 2>/dev/null)
+            p=${st#/proc/}; p=${p%/status}
+            printf '    %s (pid %s) is being traced by %s (pid %s)\n' "$(cat "/proc/$p/comm" 2>/dev/null)" "$p" "$(cat "/proc/$tp/comm" 2>/dev/null)" "$tp"
+        done)
+    [ -n "$tr" ] && so="$so
+  programs being traced (a tracer can read every key typed into them):
+$tr"
+    # /dev/vcs* hold the text on each console screen (what you type in the Proxmox console)
+    vr=$(ls -l /proc/[0-9]*/fd 2>/dev/null | awk '/^\/proc\/[0-9]+\/fd:$/ {p = $0; sub(/^\/proc\//, "", p); sub(/\/fd:$/, "", p); next}
+            / -> \/dev\/vcs/ {print p}' | sort -u | while read -r p; do
+            c=$(cat "/proc/$p/comm" 2>/dev/null)
+            case "$c" in gpm|brltty) continue ;; esac
+            printf '    %s (pid %s) has a console screen open\n' "$c" "$p"
+        done)
+    [ -n "$vr" ] && so="$so
+  programs reading what is on a console screen:
+$vr"
+    if [ -n "$so" ]; then
+        say "$so" | sed '/^$/d'
+        flag
+        nxt "find the sender's session (who -u, or ps -t <terminal>), write it down, then kill it: pkill -9 -t <terminal>"
+        say "        Then run: sh first30.sh quiet. Spam that keeps coming after that is from a root session."
+    else
+        ok "no one is sending to terminals, tracing programs, or reading console screens"
+        [ -s "$QUIET_UNDO" ] || say "  Spam protection is not on. Turn it on: sh first30.sh quiet   (menu 11)"
+    fi
+}
+
+chk_sniff() {
+    sec sniff "Programs that read raw network traffic (BPFDoor-style backdoors and sniffers; T1205.002, T1040)"
+    sn=$( { awk 'NR > 1 {print $NF}' /proc/net/packet 2>/dev/null
+            awk 'NR > 1 {print $10}' /proc/net/raw /proc/net/raw6 2>/dev/null; } | sort -u | tr '\n' ' ')
+    sout=''
+    if [ -n "$(printf '%s' "$sn" | tr -d ' 0')" ]; then
+        holders=$(ls -l /proc/[0-9]*/fd 2>/dev/null | awk -v want=" $sn" '
+            /^\/proc\/[0-9]+\/fd:$/ {p = $0; sub(/^\/proc\//, "", p); sub(/\/fd:$/, "", p); next}
+            / -> socket:\[/ {i = $NF; gsub(/[^0-9]/, "", i); if (index(want, " " i " ")) print p}' | sort -u)
+        for pid in $holders; do
+            exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+            mark=''
+            case "$comm" in
+                dhclient|dhcpcd|NetworkManager|systemd-network*|wpa_supplicant|lldpd|keepalived|tcpdump|dumpcap|arpwatch|snort|suricata|zeek|dhcpd|udhcpc|ladvd|chronyd|ntpd|ping|ping6|traceroute|nmap|arping) ;;
+                *) mark='  <- not a usual one, check it' ;;
+            esac
+            from_package "${exe% (deleted)}"
+            [ $? = 1 ] && mark='  <- NOT from any package: likely a backdoor'
+            case "$exe" in *' (deleted)') mark='  <- its program file is DELETED: likely a backdoor' ;; esac
+            sout="$sout
+  pid $pid $comm ($exe)$mark"
+        done
+    fi
+    for i in /sys/class/net/*; do
+        [ -d "$i/brport" ] && continue      # bridge ports are promiscuous on purpose
+        fl=$(cat "$i/flags" 2>/dev/null) || continue
+        case "$fl" in 0x*) ;; *) continue ;; esac
+        [ $(( $fl & 256 )) -ne 0 ] && sout="$sout
+  ${i##*/} is in promiscuous mode: something is reading all traffic on the wire  <- check it"
+    done
+    if [ -n "$sout" ]; then
+        say "$sout" | sed '/^$/d'
+        if printf '%s' "$sout" | grep -q '<-'; then
+            flag
+            nxt "a program reading raw traffic needs no open port. Save evidence (evidence /proc/<pid>/exe) and tell your lead."
+        else
+            say "  (these are normal network helpers)"
+        fi
+    else
+        ok "nothing is reading raw network traffic"
+    fi
+}
+
+hidden_pids() {   # PIDs that exist but do not show when /proc is listed
+    hl=" $(cd /proc && echo [0-9]*) "
+    hm=$(awk '{print $5}' /proc/loadavg 2>/dev/null)
+    case "$hm" in ''|*[!0-9]*) hm=0 ;; esac
+    for hp in $hl; do [ "$hp" -gt "$hm" ] && hm=$hp; done
+    [ "$hm" -gt 400000 ] && hm=400000
+    hi=1 hc=''
+    while [ "$hi" -le "$hm" ]; do
+        if [ -d "/proc/$hi" ]; then
+            case "$hl" in
+                *" $hi "*) ;;
+                *) [ "$(awk '/^Tgid:/ {print $2}' "/proc/$hi/status" 2>/dev/null)" = "$hi" ] && hc="$hc $hi" ;;
+            esac
+        fi
+        hi=$((hi + 1))
+    done
+    # look again, so a process that just started is not counted as hidden
+    hl=" $(cd /proc && echo [0-9]*) "
+    for hp in $hc; do
+        case "$hl" in *" $hp "*) continue ;; esac
+        [ -d "/proc/$hp" ] && say "$hp"
+    done
+}
+
+hidden_ports() {   # listening TCP ports seen by ss but not in /proc/net/tcp, or the other way
+    { for f in /proc/net/tcp /proc/net/tcp6; do
+          [ -r "$f" ] && awk 'NR > 1 && $4 == "0A" {split($2, a, ":"); print a[2]}' "$f"
+      done | sort -u | while read -r h; do printf 'P %d\n' "0x$h"; done | sort -u
+      ss -tln 2>/dev/null | awk 'NR > 1 {n = split($4, a, ":"); print "S " a[n]}' | sort -u
+    } | awk '{s[$2] = s[$2] $1} END {for (k in s) if (s[k] == "S") print k " (ss shows it, /proc/net/tcp hides it)"; else if (s[k] == "P") print k " (/proc/net/tcp shows it, ss hides it)"}'
+}
+
+chk_rootkit() {
+    sec rootkit "Rootkit checks: things hidden from normal tools (T1014)"
+    rbad=''
+    rp=$(hidden_pids)
+    [ -n "$rp" ] && rbad="$rbad
+  hidden processes (exist, but listing /proc does not show them):$(for p in $rp; do printf '\n    pid %s: %s (%s)' "$p" "$(cat /proc/$p/comm 2>/dev/null)" "$(readlink /proc/$p/exe 2>/dev/null)"; done)"
+    if have ss; then
+        r1=$(hidden_ports); r2=''
+        [ -n "$r1" ] && { sleep 1; r2=$(hidden_ports); }
+        rpo=$(printf '%s\n' "$r1" | while IFS= read -r l; do [ -n "$l" ] && printf '%s\n' "$r2" | grep -q -x -F -- "$l" && say "    port $l"; done)
+        [ -n "$rpo" ] && rbad="$rbad
+  hidden listening ports:
+$rpo"
+    fi
+    rm1=$( { for d in /sys/module/*; do [ -e "$d/initstate" ] && say "S ${d##*/}"; done
+             awk '{print "P " $1}' /proc/modules 2>/dev/null; } |
+           awk '{s[$2] = s[$2] $1} END {for (k in s) if (s[k] == "S") print "    " k " (loaded, but missing from the module list)"}')
+    [ -n "$rm1" ] && rbad="$rbad
+  hidden kernel modules:
+$rm1"
+    if have dmesg; then
+        rb=$(dmesg 2>/dev/null | grep -i -E 'bpf_probe_write_user|bpf_override_return' | tail -3)
+        [ -n "$rb" ] && rbad="$rbad
+  the kernel warned about an eBPF program that changes other programs' memory (a rootkit trait):
+$(say "$rb" | sed 's/^/    /')"
+    fi
+    if [ -n "$rbad" ]; then
+        say "$rbad" | sed '/^$/d'
+        flag
+        nxt "tell your lead NOW. A rootkit means this box cannot be trusted. Save evidence, then restore or rebuild it."
+    else
+        ok "no hidden processes, ports or kernel modules"
+    fi
+    # kernel modules that came from outside the distribution, and eBPF owners (info)
+    km=$(awk '{print $1}' /proc/modules 2>/dev/null | while read -r m; do
+        kt=$(cat "/sys/module/$m/taint" 2>/dev/null)
+        kf=$(modinfo -n "$m" 2>/dev/null)
+        why=''
+        [ -n "$kt" ] && why="taint $kt"
+        if [ -z "$kf" ]; then why="$why, file not under /lib/modules"
+        else from_package "$kf"; [ $? = 1 ] && why="$why, not from a package"; fi
+        why=${why#, }
+        [ -n "$why" ] && printf '    %s (%s)\n' "$m" "$why"
+    done)
+    if [ -n "$km" ]; then
+        say "  kernel modules from outside the distribution (VirtualBox, ZFS or NVIDIA drivers show here too):"
+        say "$km"
+        say "  kernel taint now: $(cat /proc/sys/kernel/tainted 2>/dev/null) (0 = clean)"
+    fi
+    kb=$(find /proc/[0-9]*/fdinfo -maxdepth 1 -type f -exec grep -l '^prog_type:' {} + 2>/dev/null |
+        cut -d/ -f3 | sort -u | while read -r p; do cat "/proc/$p/comm" 2>/dev/null; done | sort | uniq -c |
+        awk '$2 !~ /^(systemd.*|\(sd-pam\)|dockerd|containerd.*|kubelet|k3s.*|cilium.*|calico.*|falco.*|tetragon|osqueryd|auditbeat|bpftrace|snapd|tracee.*)$/ {print "    " $2 " holds " $1 " eBPF program(s)"}')
+    if [ -n "$kb" ]; then
+        say "  programs holding eBPF programs (systemd and container tools do this; anything else, check):"
+        say "$kb"
+    fi
+}
+
+chk_pam() {
+    sec pam "PAM lines that run a program or hand out passwords (T1556.003)"
+    pout=$( { grep -r -n -E 'pam_exec|expose_authtok' /etc/pam.d 2>/dev/null
+              grep -r -n -E '[[:space:]]/[^[:space:]]+\.so' /etc/pam.d 2>/dev/null |
+                  grep -v -E '/(usr/)?lib(64)?/([^/]+/)?security/'
+            } | grep -v -E ':[0-9]+:[[:space:]]*#' | sort -u)
+    if [ -n "$pout" ]; then
+        say "$pout" | sed 's/^/  /'
+        say "  At the invitational: pam_exec ran a password stealer (unicode.so) from common-password."
+        flag
+        nxt "compare with your backup copy. Save evidence of the program it runs, then remove the line (with your lead)."
+    else
+        ok "none"
+    fi
+}
+
+chk_pkg() {
+    sec pkg "Program files that no longer match their package (T1554, T1556.003, T1574)"
+    say "   Catches a swapped pam_deny.so, sshd, sudo, auditd or login. Config files you edited show as CONFIG."
+    if have dpkg; then vo=$(verify_pkgs $SEC_PKGS); else vo=$(verify_pkgs $RPM_SEC_PKGS); fi
+    if [ -n "$vo" ]; then
+        say "$vo" | sed 's/^/  /'
+        if printf '%s\n' "$vo" | grep -q -v '^CONFIG'; then
+            flag
+            nxt "a CHANGED program file is a swapped program. Save evidence, then reinstall its package, for example:"
+            say "        $(reinstall_cmd "$(printf '%s\n' "$vo" | grep -v '^CONFIG' | head -1 | sed 's/^[A-Z]*: //')" 2>/dev/null)"
+        fi
+    else
+        ok "every program file of PAM, SSH, sudo, login, auditd, systemd and cron matches its package"
+    fi
+    # Someone can edit the package database so a planted file looks like it belongs
+    # to a package. The packages stayed the same but their file lists changed:
+    if have dpkg && [ -f "$BASE" ] && [ -n "$NOW_SNAP" ] && [ -f "$NOW_SNAP" ]; then
+        pb=$(grep '^PKGDB ' "$BASE"); pn=$(grep '^PKGDB ' "$NOW_SNAP")
+        kb=$(grep '^PKG ' "$BASE" | cksum); kn=$(grep '^PKG ' "$NOW_SNAP" | cksum)
+        if [ -n "$pb" ] && [ "$pb" != "$pn" ] && [ "$kb" = "$kn" ]; then
+            say "  The package DATABASE was edited by hand: no package was installed or removed, but the"
+            say "  file lists or checksums changed. That hides planted files from the checks above."
+            flag
+        fi
+    fi
+}
+
+chk_preload() {
+    sec preload "LD_PRELOAD, and libraries loaded into sshd (T1574.006)"
+    lout=$( {
+        [ -s /etc/ld.so.preload ] && sed 's|^|  /etc/ld.so.preload has: |' /etc/ld.so.preload
+        grep -r -n 'LD_PRELOAD' /etc/systemd /run/systemd/system /etc/environment /etc/profile \
+            /etc/profile.d /etc/bash.bashrc /root/.bashrc /root/.profile 2>/dev/null | sed 's/^/  /'
+        for d in /proc/[0-9]*; do
+            v=$(tr '\0' '\n' 2>/dev/null < "$d/environ" | grep '^LD_PRELOAD=') || continue
+            printf '  pid %s (%s) runs with %s\n' "${d#/proc/}" "$(cat "$d/comm" 2>/dev/null)" "$v"
+        done
+        for sp in $(pgrep -x sshd 2>/dev/null); do
+            awk '$6 ~ /\.so/ {print $6}' "/proc/$sp/maps" 2>/dev/null | sort -u | while read -r lib; do
+                from_package "$lib"
+                [ $? = 1 ] && printf '  sshd (pid %s) has a library loaded that no package installed: %s\n' "$sp" "$lib"
+            done
+        done
+      } )
+    if [ -n "$lout" ]; then
+        say "$lout"
+        say "  At the invitational: a drop-in (ssh.service.d/zz-udev-cache.conf) loaded a library into sshd."
+        flag
+        nxt "save evidence of the library, remove the line or drop-in, then systemctl daemon-reload and restart the service."
+    else
+        ok "none"
+    fi
+}
+
+chk_sudo() {
+    sec sudo "sudo rules beyond the usual admins, and every NOPASSWD rule (T1548.003)"
+    dout=$(for f in /etc/sudoers /etc/sudoers.d/*; do
+        [ -f "$f" ] || continue
+        grep -v -E '^[[:space:]]*(#|$|Defaults|@include)' "$f" 2>/dev/null |
+            awk '!/^[[:space:]]*(root|%sudo|%wheel|%admin)[[:space:]]/ || /NOPASSWD/' | sed "s|^|  $f: |"
+    done)
+    if [ -n "$dout" ]; then
+        say "$dout"
+        say "  At the invitational: /etc/sudoers.d/domain-users gave every domain user root."
+        flag
+        nxt "if your team did not add it: copy it to evidence, then remove it with visudo -f <file> (with your lead)."
+    else
+        ok "only the usual admin rules"
+    fi
+}
+
+chk_accounts() {
+    sec accounts "Accounts: root-level, no password, system accounts that can log in (T1136, T1098)"
+    aout=$( {
+        awk -F: '$3 == 0 && $1 != "root" {print "  root-level account (UID 0): " $1}' /etc/passwd
+        [ -r /etc/shadow ] && awk -F: '$2 == "" {print "  NO password at all: " $1}' /etc/shadow
+        awk -F: '{n[$3]++; u[$3] = u[$3] " " $1} END {for (i in n) if (n[i] > 1 && i != 0) print "  accounts sharing UID " i ":" u[i]}' /etc/passwd
+        grep -n '^[+-]' /etc/passwd /etc/shadow /etc/group 2>/dev/null | sed 's/^/  old NIS "+" line: /'
+        awk -F: '$3 > 0 && $3 < 1000 && $7 !~ /(nologin|false|sync|shutdown|halt)$/ && $7 != "" &&
+                 $1 !~ /^(postgres|git|gitea|forgejo|gitlab-runner|jenkins)$/ {print "  system account with a login shell: " $1 " (" $7 ")"}' /etc/passwd
+      } )
+    if [ -n "$aout" ]; then
+        say "$aout"
+        flag
+        nxt "ask your team. To lock an account you do not know: usermod -L <name> and usermod -s /usr/sbin/nologin <name>"
+    else
+        ok "only root has UID 0, every account has a password, no system account has a login shell"
+    fi
+    for g in sudo wheel admin docker lxd disk shadow; do
+        gm=$(awk -F: -v g="$g" '$1 == g {print $4}' /etc/group 2>/dev/null)
+        [ -n "$gm" ] || continue
+        case "$g" in
+            sudo|wheel|admin) gw='can become root with sudo' ;;
+            docker|lxd) gw='same as root: can start a container that mounts the whole disk' ;;
+            disk) gw='can read any file straight off the disk' ;;
+            shadow) gw='can read the password hashes' ;;
+        esac
+        say "  $g group: $gm   ($gw)"
+    done
+}
+
+chk_keys() {
+    sec keys "SSH keys, and keys in unusual places (T1098.004)"
+    kf=$( { awk -F: '{print $6}' /etc/passwd | sort -u | while read -r h; do
+                for f in "$h"/.ssh/authorized_keys*; do [ -f "$f" ] && say "$f"; done
+            done
+            find /etc /opt /srv /usr/local /var/lib /var/www -xdev \
+                \( -path /var/lib/docker -o -path /var/lib/containerd \) -prune -o \
+                -name 'authorized_keys*' -type f -print 2>/dev/null
+          } | sort -u)
+    kodd=0
+    if [ -n "$kf" ]; then
+        printf '%s\n' "$kf" | while read -r f; do
+            case "$f" in /root/*|/home/*) say "  $f" ;; *) say "  $f   <- outside a home folder" ;; esac
+            awk '{for (i = 1; i <= NF; i++) if ($i ~ /^AAAA/) {c = ""; for (j = i + 1; j <= NF; j++) c = c " " $j
+                  print "      key:" (c == "" ? " (no comment)" : c); break}}' "$f" 2>/dev/null
+        done
+        printf '%s\n' "$kf" | grep -q -v -E '^/(root|home)/' && kodd=1
+        say "  At the invitational: a root@localhost key was planted in /etc/ssh/.ssh/authorized_keys."
+    else
+        say "  no SSH key files"
+    fi
+    sb=$(find_sshd) && "$sb" -T 2>/dev/null | grep -i -E '^(authorizedkeysfile|authorizedkeyscommand) ' | sed 's/^/  sshd setting: /'
+    if [ "$kodd" = 1 ]; then
+        flag
+        nxt "a key file outside a home folder only works if sshd points there. Save it as evidence, then empty it."
+    fi
+    say "  Every key above: does your team know it? A planted key survives every password change."
+}
+
+chk_sshd() {
+    sec sshd "SSH server settings that open a back door (T1098.004, T1556)"
+    sb=$(find_sshd) || { ok "no sshd on this box"; return 0; }
+    sv=$("$sb" -T 2>/dev/null)
+    rk=$(printf '%s\n' "$sv" | awk '
+        $1 == "permitemptypasswords" && $2 == "yes" {print "  PermitEmptyPasswords yes: accounts with no password can log in"}
+        $1 == "permituserenvironment" && $2 != "no" {print "  PermitUserEnvironment " $2 ": a user file can set LD_PRELOAD for their session"}
+        $1 == "hostbasedauthentication" && $2 == "yes" {print "  HostbasedAuthentication yes: trusts other machines instead of passwords"}
+        $1 == "ignorerhosts" && $2 == "no" {print "  IgnoreRhosts no: .rhosts files are trusted"}
+        $1 == "trustedusercakeys" && $2 != "none" {print "  TrustedUserCAKeys " $2 ": any certificate signed by that key logs in"}
+        $1 == "authorizedkeyscommand" && $2 != "none" {print "  AuthorizedKeysCommand " $2 ": a program decides which keys work"}
+        $1 == "authorizedprincipalsfile" && $2 != "none" {print "  AuthorizedPrincipalsFile " $2}
+        $1 == "gatewayports" && $2 != "no" {print "  GatewayPorts " $2 ": SSH tunnels can open ports for other machines"}
+        $1 == "permittunnel" && $2 != "no" {print "  PermitTunnel " $2 ": SSH can carry a whole network tunnel"}
+        $1 == "forcecommand" && $2 != "none" {print "  ForceCommand " $2}')
+    for f in /etc/ssh/sshrc /root/.ssh/rc /home/*/.ssh/rc /root/.ssh/environment /home/*/.ssh/environment /root/.rhosts /home/*/.rhosts /etc/hosts.equiv; do
+        [ -f "$f" ] && rk="$rk
+  $f exists: it runs, sets variables or grants trust at every SSH login"
+    done
+    say "  now: $(printf '%s\n' "$sv" | awk '$1 == "permitrootlogin" {r = $2} $1 == "passwordauthentication" {p = $2} END {print "root login " r ", password login " p}')"
+    if [ -n "$rk" ]; then
+        say "$rk" | sed '/^$/d'
+        flag
+        nxt "if your team did not set it, fix it in /etc/ssh/sshd_config (or the file in sshd_config.d), test with sshd -t, then reload."
+    else
+        ok "none of the risky settings are on"
+    fi
+}
+
+auth_log() {   # the recent SSH and login log, from a file or from the journal
+    for al in /var/log/auth.log /var/log/secure; do
+        [ -f "$al" ] && [ -r "$al" ] && { tail -n 20000 "$al"; return 0; }
+    done
+    have journalctl && journalctl -u ssh -u sshd --since -6h --no-pager 2>/dev/null
+}
+
+outside_nets() {   # is $1 outside OURNETS? (no OURNETS set: never)
+    [ -n "$OURNETS" ] || return 1
+    case "$1" in *:*|'') return 1 ;; esac
+    for on in $OURNETS; do in_net "$1" "$on" && return 1; done
+    return 0
+}
+
+chk_logins() {
+    sec logins "Who is logged in now, and who logged in recently (T1078 Valid Accounts, T1110)"
+    lbad=0
+    if have who; then
+        w=$(who 2>/dev/null)
+        if [ -n "$w" ]; then
+            say "  logged in right now:"
+            printf '%s\n' "$w" | while read -r wl; do
+                wip=$(printf '%s\n' "$wl" | sed -n 's/.*(\([0-9.]*\)).*/\1/p')
+                m=''
+                [ -n "$wip" ] && outside_nets "$wip" && m='   <- from outside your networks'
+                say "    $wl$m"
+            done
+            for wip in $(printf '%s\n' "$w" | sed -n 's/.*(\([0-9.]*\)).*/\1/p'); do outside_nets "$wip" && lbad=1; done
+        fi
+    fi
+    src=$(auth_log)
+    acc=$(printf '%s\n' "$src" | grep -E 'sshd.*Accepted (password|publickey|keyboard-interactive|gssapi)')
+    if [ -n "$acc" ]; then
+        say "  SSH logins that worked (account, from, how; count, newest last):"
+        printf '%s\n' "$acc" | sed -n 's/.*Accepted \([^ ]*\) for \([^ ]*\) from \([^ ]*\) .*/\2 \3 \1/p' |
+            awk '{k = $1 " " $2 " " $3; if (!(k in n)) o[++c] = k; n[k]++} END {for (i = 1; i <= c; i++) {split(o[i], a, " "); printf "    %-16s from %-16s %-10s x%d\n", a[1], a[2], a[3], n[o[i]]}}' | tail -12
+        for aip in $(printf '%s\n' "$acc" | sed -n 's/.* from \([0-9.]*\) .*/\1/p' | sort -u); do
+            outside_nets "$aip" && { say "    $aip is outside your networks"; lbad=1; }
+        done
+    fi
+    fails=$(printf '%s\n' "$src" | grep -E 'Failed password|Invalid user')
+    if [ -n "$fails" ]; then
+        say "  failed SSH logins, top sources (count, address):"
+        printf '%s\n' "$fails" | grep -o -E 'from [0-9a-fA-F.:]+' | awk '{print $2}' |
+            sort | uniq -c | sort -rn | head -5 | sed 's/^/   /'
+        say "  top account names tried:"
+        printf '%s\n' "$fails" | sed -n -E 's/.*(Failed password for (invalid user )?|Invalid user )([^ ]+) from.*/\3/p' |
+            sort | uniq -c | sort -rn | head -5 | sed 's/^/   /'
+        ftop=$(printf '%s\n' "$fails" | grep -o -E 'from [0-9a-fA-F.:]+' | awk '{print $2}' | sort | uniq -c | sort -rn | awk 'NR == 1 {print $1}')
+        [ "${ftop:-0}" -ge 20 ] && lbad=1
+    fi
+    [ -z "$acc$fails" ] && say "  no SSH logins in the recent log"
+    if [ "$lbad" = 1 ]; then
+        flag
+        nxt "a login you cannot explain: find the session (who -u), save the time and address, then sh first30.sh block <address>."
+        say "        Password guessing from one address: block it too. Never block the scoring engine (check the packet)."
+    fi
+    [ -z "$OURNETS" ] && say "  Tip: tell the script your networks so outside addresses get marked: sh first30.sh nets 10.100.130.0/24"
+}
+
+chk_jobs() {
+    sec jobs "Scheduled jobs and auto-starts that download, decode or call out (T1053, T1105, T1059.004)"
+    jout=$(grep -r -n -I -E 'curl |wget |base64 +(-d|--decode)|python[0-9.]* +-c|perl +-e|/dev/tcp/|/dev/udp/|nc +-e|ncat +-e|socat |mkfifo|openssl +s_client|bash +-i|sh +-i|chmod +\+x +/(tmp|dev/shm|var/tmp)|\| *(ba)?sh( |$)' \
+        /etc/crontab /etc/cron.d /etc/cron.hourly /etc/cron.daily /var/spool/cron /etc/systemd/system \
+        /usr/local/lib/systemd/system /etc/rc.local /etc/profile.d /etc/init.d /etc/inetd.conf /etc/xinetd.d \
+        /var/spool/cron/atjobs /var/spool/at /etc/systemd/user /root/.config/systemd/user 2>/dev/null |
+        grep -v -E ':[0-9]+:[[:space:]]*#' | head -30)
+    jx=''
+    if have atq; then
+        aq=$(atq 2>/dev/null)
+        [ -n "$aq" ] && jx="$jx
+  at jobs waiting to run (atq; read one with at -c <number>):
+$(say "$aq" | sed 's/^/    /')"
+    fi
+    for d in /root/.config/systemd/user /home/*/.config/systemd/user; do
+        [ -d "$d" ] && jx="$jx
+  user services in $d: $(ls "$d" 2>/dev/null | tr '\n' ' ')"
+    done
+    [ -n "$(ls /var/lib/systemd/linger 2>/dev/null)" ] && jx="$jx
+  accounts whose own services start at boot (linger): $(ls /var/lib/systemd/linger | tr '\n' ' ')"
+    iw=$( { grep -v -E '^[[:space:]]*(#|$)' /etc/inetd.conf 2>/dev/null
+            grep -l -i -E 'disable[[:space:]]*=[[:space:]]*no' /etc/xinetd.d/* 2>/dev/null | sed 's/^/xinetd service on: /'
+            grep -H -n -i -E '(spawn|twist)' /etc/hosts.allow /etc/hosts.deny 2>/dev/null | grep -v -E ':[0-9]+:[[:space:]]*#'
+          } )
+    [ -n "$iw" ] && jx="$jx
+  inetd services, and hosts.allow/deny lines that run a command (old-school backdoors):
+$(say "$iw" | sed 's/^/    /')"
+    if [ -n "$jout$jx" ]; then
+        [ -n "$jout" ] && say "$jout" | sed 's/^/  /'
+        [ -n "$jx" ] && say "$jx" | sed '/^$/d'
+        say "  At the invitational: dropper scripts (/tmp/coord_*.sh) pulled the imix agent over HTTP."
+        flag
+        nxt "read the whole job. If it is not your team's: copy it to evidence, then remove it (crontab -e, atrm, or delete the file)."
+    else
+        ok "no scheduled job downloads, decodes or opens a connection"
+    fi
+}
+
+chk_shellinit() {
+    sec shellinit "Shell startup files that hijack commands or hide history (T1546.004, T1070.003)"
+    sf=''
+    for f in /etc/profile /etc/profile.d/*.sh /etc/bash.bashrc /etc/bashrc /etc/zsh/zshrc /etc/zshrc /etc/environment \
+        /root/.bashrc /root/.profile /root/.bash_profile /root/.bash_login /root/.bash_logout /root/.zshrc \
+        /home/*/.bashrc /home/*/.profile /home/*/.bash_profile /home/*/.bash_login /home/*/.bash_logout /home/*/.zshrc; do
+        [ -f "$f" ] && sf="$sf
+$f"
+    done
+    iout=$(printf '%s\n' "$sf" | sed '/^$/d' | tr '\n' '\0' | xargs -0 grep -H -n -E \
+        'alias[[:space:]]+(sudo|su|ssh|passwd|ps|ss|netstat|who|w|last|kill|lsof|top|crontab|systemctl|iptables|history)=|^[[:space:]]*(function[[:space:]]+)?(sudo|su|ssh|passwd|ps|ss|netstat|crontab|systemctl|iptables)[[:space:]]*\(\)|trap[[:space:]].*(DEBUG|RETURN)|LD_PRELOAD|HISTFILE=/dev/null|unset[[:space:]]+HISTFILE|HISTSIZE=0|HISTFILESIZE=0|set[[:space:]]+\+o[[:space:]]+history|PROMPT_COMMAND=.*(history|>>|curl|wget|nc |/dev/tcp|logger)|/dev/tcp/|nc[[:space:]]+-e|(curl|wget)[[:space:]].*\|[[:space:]]*(ba)?sh|base64[[:space:]]+(-d|--decode)' \
+        2>/dev/null | grep -v -E ':[0-9]+:[[:space:]]*#')
+    for h in /root/.bash_history /root/.zsh_history /home/*/.bash_history /home/*/.zsh_history; do
+        [ -L "$h" ] && iout="$iout
+$h -> $(readlink "$h")  (command history is being thrown away)"
+    done
+    iout=$(printf '%s\n' "$iout" | sed '/^$/d')
+    if [ -n "$iout" ]; then
+        say "$iout" | sed 's/^/  /'
+        flag
+        nxt "an alias or function named sudo or su can steal passwords. Remove the line; check in a NEW shell with: type sudo"
+    else
+        ok "no command hijacks and no history tricks in the shell startup files"
+    fi
+}
+
+chk_tamper() {
+    sec tamper "Locked files and hidden file content (chattr +i, T1222.002; content filters, T1014)"
+    tl=$(locked_files)
+    th=''
+    for f in /etc/ld.so.preload /etc/passwd /etc/shadow /etc/group /etc/sudoers /etc/crontab /etc/ssh/sshd_config \
+        /etc/pam.d/common-auth /etc/pam.d/common-password /etc/pam.d/system-auth /etc/pam.d/sshd /root/.ssh/authorized_keys /etc/modules /etc/hosts; do
+        [ -f "$f" ] || continue
+        s1=$(stat -c %s "$f" 2>/dev/null) || continue
+        s2=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+        [ "$s1" != "$s2" ] && th="$th
+    $f: the disk says $s1 bytes, reading it gives $s2 (something filters what you see)"
+    done
+    # permissions (CIS 6.1, 6.2.6): password hashes readable by everyone, key files anyone can
+    # edit, and folders in root's PATH that anyone can write to (a fake ls or sudo planted there)
+    for f in /etc/shadow /etc/gshadow /etc/shadow- /etc/gshadow-; do
+        [ -f "$f" ] || continue
+        case "$(stat -c %a "$f" 2>/dev/null)" in *[1-7]) th="$th
+    $f can be read by every account (the password hashes): chmod 640 $f" ;; esac
+    done
+    tw=$( { find /etc/passwd /etc/group /etc/shadow /etc/sudoers /etc/sudoers.d /etc/crontab /etc/cron.d /etc/ssh \
+                /etc/pam.d /etc/ld.so.preload /etc/profile /etc/profile.d /etc/systemd/system /root/.ssh -xdev -perm -0002 \
+                ! -type l 2>/dev/null
+            find /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /root -maxdepth 0 -perm -0002 ! -type l 2>/dev/null
+          } | sort -u)
+    [ -n "$tw" ] && th="$th
+    anyone can change these (world-writable): $(printf '%s ' $tw)"
+    if [ -n "$tl$th" ]; then
+        if [ -n "$tl" ]; then
+            say "  locked files (i = nobody can change or delete it, a = can only grow):"
+            say "$tl" | sed 's/^/    /'
+        fi
+        [ -n "$th" ] && say "  files with hidden content or unsafe permissions:$th"
+        flag
+        nxt "fix permissions with the chmod shown. Unlock a locked file with chattr -i <file> (or -a) before you change it."
+    else
+        ok "no locked files, file sizes match what reading them gives, and permissions are safe"
+    fi
+}
+
+chk_logs() {
+    sec logs "Logs: cleared, cut short, or switched off (T1070.002, T1562.006)"
+    lst="$VAULT/.logstate_$HOST"
+    lnew="$lst.new.$$"
+    lout=''
+    : > "$lnew"
+    for f in /var/log/auth.log /var/log/secure /var/log/syslog /var/log/messages /var/log/kern.log \
+        /var/log/audit/audit.log /var/log/wtmp /var/log/btmp /var/log/lastlog /var/log/cron \
+        /var/log/nginx/access.log /var/log/apache2/access.log /var/log/httpd/access_log; do
+        if [ -L "$f" ]; then
+            case "$(readlink "$f")" in /dev/null) lout="$lout
+    $f points to /dev/null: nothing gets saved" ;; esac
+            continue
+        fi
+        [ -f "$f" ] || continue
+        # shellcheck disable=SC2046
+        set -- $(stat -c '%i %s' "$f" 2>/dev/null)
+        [ "$#" = 2 ] || continue
+        printf '%s %s %s\n' "$f" "$1" "$2" >> "$lnew"
+        old=$(awk -v f="$f" '$1 == f {print $2, $3}' "$lst" 2>/dev/null)
+        [ -n "$old" ] || continue
+        oi=${old% *} os=${old#* }
+        if [ "$oi" = "$1" ] && [ "$2" -lt "$os" ]; then
+            lout="$lout
+    $f got SMALLER since the last hunt ($os -> $2 bytes, same file): it was cut"
+        fi
+    done
+    mv "$lnew" "$lst" 2>/dev/null
+    if [ ! -e /var/log/auth.log ] && [ ! -e /var/log/secure ] && have rsyslogd; then
+        lout="$lout
+    the login log (auth.log or secure) is missing"
+    fi
+    for f in /etc/rsyslog.conf /etc/rsyslog.d/*.conf; do
+        [ -f "$f" ] || continue
+        r=$(grep -n -E '^[[:space:]]*[^#&[:space:]].*[[:space:]](stop|~)[[:space:]]*$' "$f" 2>/dev/null)
+        [ -n "$r" ] && lout="$lout
+    $f throws log lines away: $r"
+        r=$(grep -n -E '^[^#]*(@@?[0-9A-Za-z[]|omfwd)' "$f" 2>/dev/null)
+        [ -n "$r" ] && say "  $f sends logs to another machine (fine if it is your team's log server): $r"
+    done
+    for f in /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf; do
+        [ -f "$f" ] && grep -q -E '^[[:space:]]*Storage=(none|volatile)' "$f" && lout="$lout
+    $f sets the journal to $(grep -E '^[[:space:]]*Storage=' "$f" | tail -1): logs are lost (or gone at reboot)"
+    done
+    if have systemctl && have rsyslogd; then
+        systemctl is-active rsyslog >/dev/null 2>&1 || systemctl is-active syslog >/dev/null 2>&1 || lout="$lout
+    rsyslog is installed but NOT running: nothing new goes into /var/log"
+    fi
+    if [ -n "$lout" ]; then
+        say "$lout" | sed '/^$/d'
+        flag
+        nxt "write down the time (it tells you when red team was here). Turn logging back on. auditd keeps its own log."
+    else
+        ok "logs are there, still growing, and none is thrown away"
+    fi
+}
+
+# ---------------------------------------------------------------- C2 (shared by hunt and c2)
+# At the invitational, a dropper put the imix agent in /tmp/.sysupd.bin, and it
+# called 10.197.114.55:8001 over HTTP.
+in_net() {   # is the IPv4 address $1 inside $2 (an address, or address/bits)?
+    awk -v ip="$1" -v net="$2" 'BEGIN {
+        if (split(net, n, "/") < 2) n[2] = 32
+        if (split(ip, a, ".") != 4 || split(n[1], b, ".") != 4) exit 1
+        m = 2 ^ (32 - n[2])
+        x = ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4]
+        y = ((b[1] * 256 + b[2]) * 256 + b[3]) * 256 + b[4]
+        exit !(int(x / m) == int(y / m))
+    }'
+}
+
+blocked_list() { [ -f "$VAULT/blocked.txt" ] && awk '{print $1}' "$VAULT/blocked.txt" | sort -u; }
+
+listen_ports() {
+    if have ss; then ss -tln 2>/dev/null | sed 1d | awk '{print $4}'
+    else netstat -tln 2>/dev/null | awk '$1 ~ /^tcp/ {print $4}'; fi | sed 's/.*://' | sort -u | tr '\n' ' '
+}
+
+conns() {   # open or opening TCP connections: STATE PEER_IP PEER_PORT LOCAL_PORT PID PROGRAM
+    if have ss; then
+        ss -tnp 2>/dev/null | awk 'NR > 1 && ($1 == "ESTAB" || $1 == "SYN-SENT") {print $1, $4, $5, $NF}'
+    elif have netstat; then
+        netstat -tnp 2>/dev/null | awk '$1 ~ /^tcp/ && ($6 == "ESTABLISHED" || $6 == "SYN_SENT") {print $6, $4, $5, $7}'
+    fi | while read -r st local peer owner; do
+        pport=${peer##*:}
+        pip=${peer%:*}; pip=${pip#\[}; pip=${pip%\]}; pip=${pip#::ffff:}
+        pid=$(printf '%s\n' "$owner" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p')
+        prog=$(printf '%s\n' "$owner" | sed -n 's/.*(("\([^"]*\)".*/\1/p')
+        if [ -z "$pid" ]; then
+            case "$owner" in [0-9]*/*) pid=${owner%%/*}; prog=${owner#*/} ;; esac
+        fi
+        printf '%s %s %s %s %s %s\n' "$st" "$pip" "$pport" "${local##*:}" "${pid:--}" "${prog:--}"
+    done
+}
+
+outbound() {   # connections this box opened to somewhere else: PEER PORT PROGRAM PID LOCAL_PORT STATE
+    conns | while read -r st ip port lport pid prog; do
+        case " $LPORTS " in *" $lport "*) continue ;; esac   # an answer from one of our own services
+        case "$ip" in 127.*|::1|'') continue ;; esac
+        printf '%s %s %s %s %s %s\n' "$ip" "$port" "$prog" "$pid" "$lport" "$st"
+    done
+}
+
+c2_rows() {
+    bl=$(blocked_list | tr '\n' ' ')
+    outbound | awk '{print $1, $2, $3, $4, $6}' | sort | uniq -c | while read -r cnt ip port prog pid st; do
+        why=''
+        for b in $bl; do in_net "$ip" "$b" && why="$why blocked-address"; done
+        outside_nets "$ip" && why="$why outside-our-networks"
+        case "$st" in SYN*) why="$why still-trying-to-connect" ;; esac
+        exe=''
+        acct='?'
+        if [ "$pid" != - ]; then
+            exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+            acct=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+            case "$exe" in
+                *' (deleted)') why="$why program-deleted" ;;
+                /tmp/*|/var/tmp/*|/dev/shm/*|*/.*) why="$why hidden-or-temp-path" ;;
+            esac
+            if [ -n "$exe" ]; then
+                from_package "${exe% (deleted)}"
+                [ $? = 1 ] && why="$why not-from-a-package"
+            fi
+        fi
+        to="$ip:$port"
+        [ "$cnt" -gt 1 ] && to="$to (x$cnt)"
+        printf '  %-16s %-7s %-10s %-22s %s\n' "$prog" "$pid" "$acct" "$to" "${why:- -}"
+        [ -n "$exe" ] && printf '  %-16s   program: %s\n' '' "$exe"
+    done
+}
+
+chk_c2() {
+    sec c2 "Connections out of this box right now (T1071; for a 30-second watch: sh first30.sh c2)"
+    LPORTS=$(listen_ports)
+    co=$(c2_rows)
+    if [ -z "$co" ]; then ok "no connections out of this box right now"; return 0; fi
+    printf '  %-16s %-7s %-10s %-22s %s\n' PROGRAM PID ACCOUNT 'TO ADDRESS:PORT' 'MARKED BECAUSE'
+    say "$co"
+    if printf '%s\n' "$co" | grep -q -E 'outside-our-networks|blocked-address|program-deleted|hidden-or-temp-path|not-from-a-package'; then
+        flag
+        nxt "write down the program, address and time. Save the program (evidence), then: sh first30.sh block <address>"
+    fi
+}
+
+chk_ci() {
+    sec ci "CI/CD runners and containers (the organizers said to expect more CI)"
+    chit=0
+    for rp in $(pgrep -f -i 'forgejo-runner|act_runner|gitea-runner|gitlab-runner|Runner\.Listener|woodpecker-agent|drone-runner' 2>/dev/null); do
+        rcmd=$(tr '\0' ' ' 2>/dev/null < "/proc/$rp/cmdline")
+        [ -n "$rcmd" ] || continue
+        say "  runner: pid $rp as $(ps -o user= -p "$rp" 2>/dev/null | tr -d ' '): $rcmd"
+        if printf '%s' "$rcmd" | grep -q ':host' || grep -q -s ':host' "/proc/$rp/cwd/.runner"; then
+            say "    Jobs run directly on THIS box (a 'host' label). Anyone who can push a workflow to the repo"
+            say "    can run commands here. Use a docker label, and limit who can push."
+            chit=1
+        fi
+    done
+    if have docker && tmo docker ps -q >/dev/null 2>&1; then
+        for cid in $(tmo docker ps -q 2>/dev/null); do
+            cinfo=$(tmo docker inspect -f '{{.Name}} privileged={{.HostConfig.Privileged}} net={{.HostConfig.NetworkMode}} pid={{.HostConfig.PidMode}}{{range .Mounts}} mount={{.Source}}{{end}}' "$cid" 2>/dev/null)
+            case "$cinfo" in
+                *privileged=true*|*net=host*|*pid=host*|*mount=/var/run/docker.sock*|*mount=/run/docker.sock*|*'mount=/ '*|*'mount=/')
+                    say "  container with host-level access: $cinfo"
+                    chit=1 ;;
+            esac
+        done
+    fi
+    if [ "$chit" = 1 ]; then flag; else ok "no CI runner with a host label, and no container with host-level access"; fi
+}
+
+chk_ransom() {
+    sec ransom "Ransomware signs: locked files and ransom notes (T1486)"
+    ro=$(find /home /root /srv /var/www /opt -xdev -maxdepth 4 -type f \( -name '*.locked' -o -name '*.encrypted' \
+        -o -iname '*ransom*' -o -iname '*decrypt*' -o -iname '*how_to_recover*' \) 2>/dev/null |
+        grep -v "^$VAULT/" | head -10)
+    if [ -n "$ro" ]; then
+        say "$ro" | sed 's/^/  /'
+        flag
+        nxt "tell your lead NOW and restore from your backup (sh first30.sh backup made a copy in $VAULT)."
+    else
+        ok "none"
+    fi
+}
+
+chk_bait() {
+    [ -n "$BAIT" ] || return 0
+    sec bait "Your bait file and bait login (T1552.001: someone went looking for passwords)"
+    say "  bait file: $BAIT   bait login name: $BAITUSER"
+    bo=''
+    [ -e "$BAIT" ] || bo="$bo
+    the bait file is GONE: someone deleted or moved it"
+    if have ausearch; then
+        br=$(ausearch -k bait --format text 2>/dev/null | grep -v -E '(add|remove)_rule' | tail -5)
+        [ -z "$br" ] && br=$(ausearch -k bait -i 2>/dev/null | grep -E 'type=SYSCALL' | tail -5)
+        [ -n "$br" ] && bo="$bo
+    someone opened the bait file (newest last):
+$(say "$br" | sed 's/^/      /')"
+    fi
+    if [ -n "$BAITUSER" ]; then
+        bu=$(auth_log | grep -F -w -- "$BAITUSER" | tail -5)
+        [ -n "$bu" ] && bo="$bo
+    someone tried the bait login name (red team read your bait and tried it):
+$(say "$bu" | sed 's/^/      /')"
+    fi
+    if [ -n "$bo" ]; then
+        say "$bo" | sed '/^$/d'
+        flag
+        nxt "this is red team. Note the time, account and address. Block the address, and hunt for how they got in."
+    else
+        ok "nobody has touched the bait"
+    fi
+}
+
+# Runs every check, in order of how often they caught something at the invitational.
+every_check() {
+    [ -n "$PTAB" ] || proc_table
+    chk_rat
+    chk_c2
+    chk_exe
+    chk_procs
+    chk_svc
+    chk_kthread
+    chk_shells
+    chk_spam
+    chk_sniff
+    chk_preload
+    chk_pam
+    chk_pkg
+    chk_sudo
+    chk_accounts
+    chk_keys
+    chk_sshd
+    chk_logins
+    chk_jobs
+    chk_shellinit
+    chk_tamper
+    chk_web
+    chk_temp
+    chk_rootkit
+    chk_logs
+    chk_ci
+    chk_ransom
+    chk_bait
+    audit_check
+}
+
+summary() {
+    say ""
+    say "======================================================================"
+    if [ "$NFOUND" -eq 0 ]; then
+        say "SUMMARY: nothing to look at."
+    else
+        say "SUMMARY: $NFOUND things to look at (top first):"
+        printf '%s\n' "$FOUND" | tr '|' '\n' | sed '/^$/d' | sed 's/^/  - /'
+        say "For each one: write down the time and what you see (sh first30.sh note \"...\"), tell your lead,"
+        say "and save evidence before you delete anything (sh first30.sh evidence <file>)."
+    fi
+}
+
+# ---------------------------------------------------------------- recon
+do_recon() {
+    need_root
+    rep="$VAULT/recon_${HOST}_$TS.txt"
+    recon_body 2>&1 | sanitize | tee "$rep"
+    chmod 600 "$rep" 2>/dev/null
+}
+
+recon_body() {
+    NOW_SNAP="$VAULT/snapshot_${HOST}_$TS.txt"
+    proc_table
+    snapshot > "$NOW_SNAP" 2>/dev/null
+    info > "$VAULT/info_${HOST}_$TS.txt" 2>&1
+    packages > "$VAULT/packages_${HOST}_$TS.txt" 2>&1
+    if [ -f "$BASE" ]; then
+        say "Baseline already exists, kept: $BASE"
+        say "Baseline seal: $(seal "$BASE")   (it must match the seal on your paper)"
+    else
+        cp "$NOW_SNAP" "$BASE"
+        save_md5sums
+        say "Baseline saved: $BASE"
+        say "Baseline seal: $(seal "$BASE")   <- WRITE THIS ON PAPER, with the box name"
+        autonote "made the baseline (seal $(seal "$BASE"))"
+    fi
+    chmod 600 "$VAULT"/*.txt 2>/dev/null
+    say ""
+    say "== $HOST: $(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2)"
+    ip -br -4 a 2>/dev/null | grep -v '^lo' || ifconfig 2>/dev/null | grep 'inet '
+    say "== Listening ports, the program, and the account it runs as (scored ones stay open)"
+    listen_accounts
+    say "== Root-level accounts (only root should be here)"
+    grep '^UID0 ' "$NOW_SNAP" | sed 's/^UID0 /  /'
+    say "== Admin groups"
+    grep -E '^GROUP (sudo|wheel|admin|docker|lxd):' "$NOW_SNAP" | sed 's/^GROUP /  /'
+    chk_self
+    every_check
+    summary
+    say ""
+    say "== Your first 30 minutes"
+    say "  1. Write the baseline seal above on paper, with the box name."
+    say "  2. Change passwords (your lead has the plan), then: sh first30.sh note \"changed passwords for ...\""
+    say "  3. Go through every finding above with your lead."
+    say "  4. Stop terminal spam: sh first30.sh quiet"
+    say "  5. Optional: plant a bait file BEFORE step 6: sh first30.sh bait /root/<a name only your team knows>"
+    say "  6. Turn on and lock the audit log: sh first30.sh auditd"
+    say "  7. Look for C2: sh first30.sh c2"
+    say "  8. Hunt every 30 minutes: sh first30.sh hunt   (or run sh first30.sh for the menu)"
+    say ""
+    say "Full details: $VAULT/info_${HOST}_$TS.txt"
+}
+
+# ---------------------------------------------------------------- hunt
+do_hunt() {
+    need_root
+    if [ ! -f "$BASE" ]; then
+        say "No baseline yet. Run this first: sh first30.sh recon   (menu choice 1)"
+        exit 1
+    fi
+    report="$VAULT/hunt_${HOST}_$TS.txt"
+    DETAILS="$VAULT/hunt_${HOST}_${TS}_details.txt"
+    PREV_SNAP=$(ls -1t "$VAULT"/snapshot_"$HOST"_*.txt 2>/dev/null | head -1)
+    [ -n "$PREV_SNAP" ] || PREV_SNAP=$BASE
+    NOW_SNAP="$VAULT/snapshot_${HOST}_$TS.txt"
+    hunt_body 2>&1 | sanitize | tee "$report"
+    chmod 600 "$report" "$DETAILS" 2>/dev/null
+}
+
+changed_files() {   # files changed after the reference file $1, oldest first: "HH:MM account path"
+    if find / -maxdepth 0 -printf '' >/dev/null 2>&1; then
+        { find /etc /root /home /usr/local /opt /srv /var/www /var/spool/cron /var/spool/at /boot \
+              /bin /sbin /usr/bin /usr/sbin /usr/lib/systemd /lib/systemd /tmp /var/tmp /dev/shm -xdev \
+              \( -path "$VAULT" -o -path '/home/*/.cache' -o -path /root/.cache -o -path '/tmp/systemd-private-*' \
+                 -o -path '/var/tmp/systemd-private-*' -o -path '/home/*/.local/share' -o -path /root/.local/share \) -prune -o \
+              -cnewer "$1" \( -type f -o -type l \) -printf '%C@ %CH:%CM %u %p\n'
+          find /usr/lib /lib /usr/lib64 /lib64 -maxdepth 2 -xdev -cnewer "$1" -type f -printf '%C@ %CH:%CM %u %p\n'
+        } 2>/dev/null | sort -n | cut -d' ' -f2-
+    else
+        { find /etc /root /home /usr/local /opt /srv /var/www /var/spool/cron /boot /bin /sbin /usr/bin /usr/sbin \
+              /usr/lib/systemd /lib/systemd /tmp /var/tmp /dev/shm -xdev -path "$VAULT" -prune -o -cnewer "$1" -type f -print
+          find /usr/lib /lib -maxdepth 2 -xdev -cnewer "$1" -type f -print
+        } 2>/dev/null
+    fi
+}
+
+hunt_body() {
+    say "Hunt on $HOST at $(date '+%H:%M') ($(now_utc))"
+    say "Baseline seal: $(seal "$BASE")   <- must match your paper. If not, someone edited the baseline: tell your lead."
+    if [ ! -f "$VAULT/.stamp_$HOST" ]; then
+        prevt="the start of the game ($(date -r "$PREV_SNAP" '+%H:%M'))"
+        say "First hunt: comparing with the start-of-game snapshot."
+    else
+        prevt="your last hunt ($(date -r "$PREV_SNAP" '+%H:%M'))"
+        say "Last hunt: $(date -r "$PREV_SNAP" '+%H:%M'), its seal $(seal "$PREV_SNAP") (should match what you posted)"
+    fi
+    stold="$VAULT/.stamp_$HOST"
+    [ -f "$stold" ] || stold=$PREV_SNAP
+    stnew="$VAULT/.stamp_new.$$"
+    touch "$stnew"
+    proc_table
+    chk_self
+    snapshot > "$NOW_SNAP" 2>/dev/null
+    chmod 600 "$NOW_SNAP"
+    : > "$DETAILS"
+
+    # ---- part 1: the last 30 minutes
+    sec last "1. What changed since $prevt"
+    new=$(awk 'NR == FNR {s[$0] = 1; next} !/^# / && !($0 in s) && !d[$0]++' "$PREV_SNAP" "$NOW_SNAP")
+    gone=$(awk 'NR == FNR {s[$0] = 1; next} !/^# / && !($0 in s) && !d[$0]++' "$NOW_SNAP" "$PREV_SNAP")
+    if [ -z "$new$gone" ]; then
+        ok "nothing in the inventory changed"
+    else
+        nl=$(printf '%s\n' "$new" | grep -c .)
+        gl=$(printf '%s\n' "$gone" | grep -c .)
+        { [ -n "$new" ] && show_diff NEW "$new"; [ -n "$gone" ] && show_diff GONE "$gone"; } > "$DETAILS.part1"
+        head -40 "$DETAILS.part1"
+        [ $((nl + gl)) -gt 40 ] && say "  ... $((nl + gl - 40)) more lines in $DETAILS"
+        { say "== changed since $prevt"; cat "$DETAILS.part1"; } >> "$DETAILS"
+        rm -f "$DETAILS.part1"
+        flag
+    fi
+    [ -n "$LEARN" ] && learn files
+    cf=$(changed_files "$stold")
+    if [ -n "$cf" ]; then
+        cc=$(printf '%s\n' "$cf" | grep -c .)
+        say "  Files changed since then ($cc; time, account, file):"
+        printf '%s\n' "$cf" | tail -40 | sed 's/^/    /'
+        [ "$cc" -gt 40 ] && say "    ... the $((cc - 40)) older ones are in $DETAILS"
+        { say "== files changed since $prevt"; printf '%s\n' "$cf"; } >> "$DETAILS"
+    else
+        say "  No files changed in the watched folders since then."
+    fi
+    ns=$(cat "$VAULT/.notes_seen_$HOST" 2>/dev/null)
+    case "$ns" in ''|*[!0-9]*) ns=0 ;; esac
+    nt=0
+    [ -f "$NOTES" ] && nt=$(wc -l < "$NOTES" | tr -d ' ')
+    if [ "$nt" -gt "$ns" ]; then
+        say "  Team notes since then (the changes your team made):"
+        tail -n "+$((ns + 1))" "$NOTES" | sed 's/^/    /'
+    else
+        say "  No team notes since then. Changed something? Write it down: sh first30.sh note \"what you did\""
+    fi
+    say "$nt" > "$VAULT/.notes_seen_$HOST"
+    [ -n "$new$gone$cf" ] && nxt "anything above that is NOT in your team notes was done by someone else. Start there."
+
+    # ---- part 2: since the baseline, as counts
+    sec base "2. Changed since the baseline ($(date -r "$BASE" '+%H:%M'))"
+    bnew=$(awk 'NR == FNR {s[$0] = 1; next} !/^# / && !($0 in s) && !d[$0]++' "$BASE" "$NOW_SNAP")
+    bgone=$(awk 'NR == FNR {s[$0] = 1; next} !/^# / && !($0 in s) && !d[$0]++' "$NOW_SNAP" "$BASE")
+    if [ -z "$bnew$bgone" ]; then
+        ok "the box matches the baseline"
+    else
+        [ -n "$bnew" ] && say "  new:  $(count_by_tag "$bnew")"
+        [ -n "$bgone" ] && say "  gone: $(count_by_tag "$bgone")"
+        say "  The full list is in $DETAILS. Part 1 shows the newest of these."
+        { say "== changed since the baseline"
+          [ -n "$bnew" ] && show_diff NEW "$bnew"
+          [ -n "$bgone" ] && show_diff GONE "$bgone"; } >> "$DETAILS"
+    fi
+
+    # ---- part 3: checks that run every time
+    say ""
+    say "== 3. Checks that run every time (they do not trust the baseline)"
+    every_check
+    summary
+    say "Saved: $report"
+    say "This hunt's seal: $(seal "$NOW_SNAP")   <- post it in your team channel with the time."
+    nh=$(date -d '+30 min' '+%H:%M' 2>/dev/null) && say "Next hunt: about $nh."
+    mv "$stnew" "$VAULT/.stamp_$HOST"
+}
+
+# ---------------------------------------------------------------- backup
+TOTALKB=0
+add_path() {
+    # $1 is a path relative to /. Skips it if missing or too big.
+    [ -e "/$1" ] || return 1
+    kb=$(du -sk "/$1" 2>/dev/null | awk '{print $1}')
+    kb=${kb:-0}
+    if [ "$kb" -gt $((MAXMB * 1024)) ]; then
+        say "  skipped /$1 ($((kb / 1024)) MB, over the $MAXMB MB limit)"
+        return 1
+    fi
+    TOTALKB=$((TOTALKB + kb))
+    return 0
+}
+
+do_backup() {
+    need_root
+    start=$(date +%s)
+    set --
+    for p in etc home var/www srv opt usr/local/etc usr/local/bin usr/local/sbin \
+        usr/share/nginx/html var/spool/cron var/named var/lib/rancher/k3s/server/manifests; do
+        add_path "$p" && set -- "$@" "$p"
+    done
+    for e in /root/* /root/.[!.]* /root/..?*; do
+        [ -e "$e" ] || continue
+        [ "$e" = "$VAULT" ] && continue
+        add_path "${e#/}" && set -- "$@" "${e#/}"
+    done
+    if [ "$#" -eq 0 ]; then
+        say "Nothing to back up was found."
+        exit 1
+    fi
+    avail=$(df -Pk "$VAULT" | awk 'NR == 2 {print $4}')
+    if [ "$TOTALKB" -gt $((avail / 2)) ]; then
+        say "Not enough free disk space: need about $((TOTALKB / 1024)) MB, $((avail / 1024)) MB free."
+        say "Nothing was backed up. Try a smaller limit: MAXMB=100 sh first30.sh backup"
+        exit 1
+    fi
+    out="$VAULT/backup_${HOST}_$TS.tgz"
+    err="$VAULT/backup_${HOST}_$TS.err"
+    say "Backing up: $*"
+    # the bait file stays out, so the backup does not set it off
+    tar -czf "$out" --exclude="${BAIT#/}" -C / "$@" 2> "$err"
+    rc=$?
+    sha256sum "$out" > "$out.sha256"
+    chmod 600 "$out" "$out.sha256" "$err"
+    say "Backup: $out ($(du -k "$out" | awk '{print $1}') KB) in $(($(date +%s) - start)) seconds"
+    if [ "$rc" -ne 0 ]; then
+        say "tar exit code $rc. Usually files that changed while reading. Check: $err"
+    elif [ -s "$err" ]; then
+        say "$(wc -l < "$err") warnings in $err (sockets and changing files are normal)"
+    fi
+    if grep -q -E ':(3306|5432|27017)$' "$BASE" 2>/dev/null || have mysqld || have mariadbd || have postgres; then
+        say "Database found. Its data files are NOT in this backup. A lead takes a proper dump."
+    fi
+    if [ -f /opt/.filetool.lst ]; then
+        say "Tiny Core: /root may live in RAM, so this backup can vanish on reboot."
+        say "After changing passwords: add etc/shadow and etc/passwd to /opt/.filetool.lst, then run filetool.sh -b"
+    fi
+}
+
+# ---------------------------------------------------------------- ssh
+find_cfg() {
+    for c in /etc/ssh/sshd_config /usr/local/etc/ssh/sshd_config; do
+        if [ -f "$c" ]; then echo "$c"; return 0; fi
+    done
+    return 1
+}
+
+reload_sshd() {
+    if have systemctl; then
+        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null ||
+            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null && return 0
+    fi
+    for s in /etc/init.d/sshd /etc/init.d/ssh /usr/local/etc/init.d/openssh /etc/rc.d/rc.sshd; do
+        [ -x "$s" ] && "$s" restart >/dev/null 2>&1 && return 0
+    done
+    pid=$(cat /run/sshd.pid /var/run/sshd.pid 2>/dev/null | head -1)
+    [ -n "$pid" ] && kill -HUP "$pid" && return 0
+    say "Could not reload sshd. Restart it by hand."
+    return 1
+}
+
+root_login_setting() {
+    "$1" -T -f "$2" 2>/dev/null | awk 'tolower($1) == "permitrootlogin" {print $2}'
+}
+
+do_ssh() {
+    need_root
+    cfg=$(find_cfg) || { say "No sshd_config found. Nothing changed."; exit 1; }
+    sshd=$(find_sshd) || { say "sshd not found. Nothing changed."; exit 1; }
+    if [ -L "$cfg" ] || [ -d /etc/nixos ]; then
+        say "This looks like NixOS. sshd_config is generated, so editing it will not stick."
+        say "Set services.openssh.settings.PermitRootLogin = \"no\"; in /etc/nixos/configuration.nix,"
+        say "then run nixos-rebuild switch. Nothing changed."
+        exit 1
+    fi
+    others=$(awk -F: 'NR == FNR { if ($2 != "" && $2 !~ /^[!*]/) ok[$1] = 1; next }
+        $1 != "root" && $3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ && ($1 in ok) {printf "%s ", $1}' \
+        /etc/shadow /etc/passwd)
+    if [ -z "$others" ]; then
+        say "No other account here has a password and a login shell."
+        say "Turning off root SSH now could lock you out. Nothing changed."
+        exit 1
+    fi
+    if [ "$(root_login_setting "$sshd" "$cfg")" = "no" ]; then
+        say "Root SSH login is already off. Nothing changed."
+        exit 0
+    fi
+    before="$VAULT/sshd_config_${HOST}_before.bak"
+    [ -f "$before" ] || cp -p "$cfg" "$before"
+    cp -p "$cfg" "$VAULT/sshd_config_${HOST}_$TS.bak"
+    # sshd uses the first value it reads, so the line goes at the very top,
+    # above any Include and outside any Match block.
+    { echo "PermitRootLogin no"; cat "$cfg"; } > "$VAULT/.sshd_new" && cat "$VAULT/.sshd_new" > "$cfg"
+    rm -f "$VAULT/.sshd_new"
+    if ! "$sshd" -t -f "$cfg"; then
+        cat "$VAULT/sshd_config_${HOST}_$TS.bak" > "$cfg"
+        say "The new config failed its test, so the old one was put back. Nothing changed."
+        exit 1
+    fi
+    reload_sshd
+    autonote "turned off root login over SSH (PermitRootLogin no at the top of $cfg)"
+    say "Root SSH login is now: $(root_login_setting "$sshd" "$cfg")"
+    say "Accounts that can still log in over SSH: $others"
+    say "Your current session stays open. Test a NEW login as one of those accounts before you log out."
+    say "If SSH on this box is scored and logs in as root, undo with: sh first30.sh undo-ssh"
+}
+
+do_undo_ssh() {
+    need_root
+    cfg=$(find_cfg) || { say "No sshd_config found."; exit 1; }
+    sshd=$(find_sshd) || { say "sshd not found."; exit 1; }
+    before="$VAULT/sshd_config_${HOST}_before.bak"
+    [ -f "$before" ] || { say "No saved config to restore."; exit 1; }
+    cat "$before" > "$cfg"
+    "$sshd" -t -f "$cfg" && reload_sshd
+    autonote "put the SSH config back (undo-ssh)"
+    say "SSH config restored. Root SSH login is now: $(root_login_setting "$sshd" "$cfg")"
+}
+
+# ---------------------------------------------------------------- auditd
+# auditd is the Linux audit log. It has to run as root, because only root may
+# control the kernel's auditing, so it cannot be moved into an account of its own.
+# It is protected instead: its rules are locked until a reboot, it watches its own
+# files and tools, only root can read its logs, and every hunt checks it.
+AUDIT_RULES=/etc/audit/rules.d/60-first30.rules
+
+audit_enabled() {   # 0 = off, 1 = on, 2 = on and locked, empty = unknown
+    auditctl -s 2>/dev/null | sed -n 's/.*enabled[ =]\([0-9]\).*/\1/p' | head -1
+}
+
+audit_running() { pidof auditd >/dev/null 2>&1 || pgrep -x auditd >/dev/null 2>&1; }
+
+audit_watch() {   # $1 = key, $2 = permissions, then paths. Skips a path whose folder is missing.
+    aw_k=$1 aw_p=$2
+    shift 2
+    for aw_f in "$@"; do
+        [ -e "$aw_f" ] || [ -d "$(dirname "$aw_f")" ] || continue
+        aw_r=$(readlink -f "$aw_f" 2>/dev/null)
+        [ -n "$aw_r" ] || aw_r=$aw_f
+        case " $AUDIT_SEEN " in *" $aw_r "*) continue ;; esac
+        AUDIT_SEEN="$AUDIT_SEEN $aw_r"
+        say "-w $aw_r -p $aw_p -k $aw_k"
+    done
+}
+
+audit_exec() {    # $1 = key, then program names: log every time one of them runs
+    ae_k=$1
+    shift
+    for ae_t in "$@"; do
+        ae_f=$(command -v "$ae_t" 2>/dev/null) || continue
+        audit_watch "$ae_k" x "$ae_f"
+    done
+}
+
+audit_syscall() {   # one syscall rule for each CPU type this box runs
+    case "$(uname -m)" in
+        x86_64) say "-a always,exit -F arch=b64 $*"; say "-a always,exit -F arch=b32 $*" ;;
+        aarch64|ppc64*|s390x) say "-a always,exit -F arch=b64 $*" ;;
+        *) say "-a always,exit -F arch=b32 $*" ;;
+    esac
+}
+
+audit_rules() {
+    AUDIT_SEEN=''
+    say "## first30 audit rules. Read the log by key: ausearch -k <key> -i"
+    say "## -i: a rule that does not fit this box is skipped instead of stopping the rest."
+    say "-i"
+    audit_watch identity wa /etc/passwd /etc/shadow /etc/group /etc/gshadow
+    audit_watch sudoers wa /etc/sudoers /etc/sudoers.d
+    audit_watch pam wa /etc/pam.d /etc/security
+    audit_watch ssh wa /etc/ssh /root/.ssh
+    audit_watch cron wa /etc/crontab /etc/anacrontab /etc/cron.d /etc/cron.hourly /etc/cron.daily \
+        /etc/cron.weekly /etc/cron.monthly /var/spool/cron /var/spool/at
+    audit_watch services wa /etc/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system \
+        /lib/systemd/system /etc/init.d /etc/rc.local /etc/systemd/user
+    audit_watch preload wa /etc/ld.so.preload /etc/ld.so.conf /etc/ld.so.conf.d /etc/environment
+    audit_watch shellinit wa /etc/profile /etc/profile.d /etc/bash.bashrc /etc/bashrc /root/.bashrc /root/.profile
+    audit_watch network wa /etc/hosts /etc/network /etc/netplan /etc/sysconfig/network-scripts \
+        /etc/NetworkManager/system-connections /etc/resolv.conf /etc/nsswitch.conf
+    audit_watch webroot wa /var/www
+    audit_watch mac wa /etc/selinux /etc/apparmor /etc/apparmor.d
+    audit_watch logins wa /var/log/lastlog /var/run/faillock /var/log/wtmp /var/log/btmp
+    [ -e /etc/localtime ] && say "-w /etc/localtime -p wa -k time-change"
+    audit_watch auditconfig wa /etc/audit /etc/audisp /etc/libaudit.conf
+    # this script's own vault and file: editing the baseline or the script gets logged
+    audit_watch first30 wa "$VAULT"
+    [ -n "$SCRIPT" ] && audit_watch first30 wa "$SCRIPT"
+    # the bait: anyone who even opens it gets logged
+    [ -n "$BAIT" ] && audit_watch bait rwa "$BAIT"
+    audit_exec audittools auditctl auditd augenrules
+    audit_exec privesc sudo su
+    audit_exec accounts useradd usermod userdel groupadd groupmod gpasswd passwd chpasswd
+    audit_exec tamper chattr setfacl
+    for sp_p in $SPAM_PROGS; do
+        sp_f=$(command -v "$sp_p" 2>/dev/null) && audit_watch spam wxa "$sp_f"
+    done
+    audit_exec modules insmod rmmod modprobe
+    audit_exec nettools nc ncat netcat socat wget curl
+    audit_syscall "-S init_module -S finit_module -S delete_module -k modules"
+    audit_syscall "-S adjtimex -S settimeofday -S clock_settime -k time-change"
+    # every command run by the web server's account: a web shell in use shows here
+    for wu in www-data apache nginx http lighttpd; do
+        wi=$(id -u "$wu" 2>/dev/null) || continue
+        audit_syscall "-S execve -F euid=$wi -k webexec"
+    done
+    say "## Lock the rules: nothing can change or delete them until a reboot."
+    say "-e 2"
+}
+
+audit_install() {
+    if have apt-get; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y auditd ||
+            { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y auditd; }
+    elif have dnf; then dnf install -y audit
+    elif have yum; then yum install -y audit
+    elif have zypper; then zypper --non-interactive install audit
+    elif have pacman; then pacman -S --noconfirm audit
+    elif have apk; then apk add audit
+    else return 1
+    fi
+}
+
+audit_check() {
+    sec audit "auditd, the Linux audit log (T1562.001: red team turns off or takes over logging)"
+    if ! have auditctl; then
+        say "  NOT installed. Set it up: sh first30.sh auditd"
+        flag
+        return 0
+    fi
+    abad=0
+    if audit_running; then say "  auditd is running"; else say "  auditd is NOT running"; abad=1; fi
+    case "$(audit_enabled)" in
+        2) say "  auditing is on and locked (good)" ;;
+        1) say "  auditing is on but NOT locked: root can delete the rules. Lock it: sh first30.sh auditd" ;;
+        0) say "  auditing is OFF"; abad=1 ;;
+        *) say "  could not read auditd's status" ;;
+    esac
+    say "  rules loaded: $(auditctl -l 2>/dev/null | grep -c -v '^No rules')"
+    # auditd starts every active plugin as root, and restarts it if it dies. A planted
+    # plugin is one way to take over auditd. Real plugins come from a package.
+    for f in /etc/audit/plugins.d/*.conf /etc/audisp/plugins.d/*.conf; do
+        [ -f "$f" ] || continue
+        grep -q -i -E '^[[:space:]]*active[[:space:]]*=[[:space:]]*yes' "$f" || continue
+        pl=$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p' "$f" | head -1)
+        case "$pl" in
+            builtin_*|'') say "  plugin on: $f (built in)" ;;
+            *)  from_package "$pl"
+                case $? in
+                    0) say "  plugin on: $f runs $pl (from a package)" ;;
+                    1) say "  plugin on: $f runs $pl  <- NOT from any package: likely planted"; abad=1 ;;
+                    *) say "  plugin on: $f runs $pl (could not check its package)" ;;
+                esac ;;
+        esac
+    done
+    if [ "$abad" = 1 ]; then
+        flag
+        nxt "tell your lead. Save evidence of any planted plugin, then: systemctl restart auditd (or reboot to reload the locked rules)."
+    fi
+}
+
+do_auditd() {
+    need_root
+    if ! have auditctl; then
+        say "auditd is not installed. Installing it from this box's package repos..."
+        if ! audit_install > "$VAULT/auditd_install_$TS.log" 2>&1 || ! have auditctl; then
+            say "The install failed (see $VAULT/auditd_install_$TS.log)."
+            say "Fix this box's package repos, then run this again."
+            exit 1
+        fi
+    fi
+    if [ "$(audit_enabled)" = 2 ]; then
+        say "The audit rules are already locked. Nothing can change them until a reboot."
+        say "To change them: edit $AUDIT_RULES, then reboot."
+        audit_check
+        return 0
+    fi
+    # Only root may change auditd's settings, rules and plugins, or read its logs.
+    chown -R root:root /etc/audit 2>/dev/null
+    chmod -R go-w /etc/audit 2>/dev/null
+    if [ -d /var/log/audit ]; then chown root:root /var/log/audit; chmod 700 /var/log/audit; fi
+    mkdir -p /etc/audit/rules.d
+    audit_rules > "$AUDIT_RULES"
+    chmod 600 "$AUDIT_RULES"
+    say "Rules written: $AUDIT_RULES ($(grep -c '^-w' "$AUDIT_RULES") files, folders and programs watched)"
+    # start it now, and at every boot
+    if have systemctl && systemctl list-units --no-legend >/dev/null 2>&1; then
+        systemctl enable auditd >/dev/null 2>&1
+        audit_running || systemctl start auditd >/dev/null 2>&1
+    elif have rc-service; then
+        rc-update add auditd default >/dev/null 2>&1
+        audit_running || rc-service auditd start >/dev/null 2>&1
+    elif have service; then
+        audit_running || service auditd start >/dev/null 2>&1
+    fi
+    # load the rules; augenrules merges everything in rules.d and always puts the lock last
+    if [ "$(audit_enabled)" != 2 ]; then
+        if have augenrules; then augenrules --load >/dev/null 2>&1
+        else auditctl -R "$AUDIT_RULES" >/dev/null 2>&1; fi
+    fi
+    autonote "set up and locked auditd ($AUDIT_RULES)"
+    from_package / >/dev/null 2>&1
+    audit_check
+    say ""
+    say "Read the log by key, for example: ausearch -k identity -i   (or: ausearch -k webexec --format text)"
+    say "Keys: identity sudoers pam ssh cron services preload shellinit network webroot mac logins time-change"
+    say "      auditconfig first30 bait audittools privesc accounts tamper spam modules nettools webexec"
+    say "To change the rules later: edit $AUDIT_RULES, then reboot."
+}
+
+# ---------------------------------------------------------------- c2 (the 30-second watch)
+do_c2() {
+    need_root
+    from_package / >/dev/null 2>&1
+    LPORTS=$(listen_ports)
+    sec c2 "Programs with connections OUT of this box right now (T1071)"
+    [ -n "$OURNETS" ] && say "   Your networks: $OURNETS (anything else is marked)"
+    printf '  %-16s %-7s %-10s %-22s %s\n' PROGRAM PID ACCOUNT 'TO ADDRESS:PORT' 'MARKED BECAUSE'
+    co=$(c2_rows)
+    if [ -n "$co" ]; then say "$co"; else say "  none"; fi
+    say ""
+    say "== Who keeps calling out? Watching for 30 seconds... (T1071)"
+    samples="$VAULT/.c2samples.$$"
+    : > "$samples"
+    i=0
+    while [ "$i" -lt 6 ]; do
+        outbound | awk -v s="$i" '{print s, $1 ":" $2, $3, $4, $5}' >> "$samples"
+        i=$((i + 1))
+        [ "$i" -lt 6 ] && sleep 5
+    done
+    # count only connections that were not there in the first look: a program that
+    # keeps a few connections open all the time is not calling out again and again
+    out=$(awk '{k = $2 " " $3 " " $4; c = k " " $5
+               if ($1 == 0) {first[c] = 1; next}
+               if ((c in first) || (c in seen)) next
+               seen[c] = 1; n[k]++}
+         END {for (k in n) if (n[k] >= 3) print n[k], k}' "$samples" | sort -rn)
+    rm -f "$samples"
+    if [ -n "$out" ]; then
+        say "  These opened 3 or more new connections to the same place in 30 seconds."
+        say "  A C2 agent checking in looks like this (so do some normal programs). Check each one:"
+        printf '%s\n' "$out" | awk '{printf "    %s new connections to %s from %s (pid %s)\n", $1, $2, $3, $4}'
+    else
+        say "  nothing kept opening new connections to the same place"
+    fi
+    say ""
+    say "Write down the time, the program and the address first: that is your incident report."
+    say "Save the program: sh first30.sh evidence /proc/<pid>/exe"
+    say "Then cut the address off, in and out: sh first30.sh block <address>"
+    [ -z "$OURNETS" ] && say "Tip: tell the script your networks so outside addresses get marked: sh first30.sh nets 10.100.130.0/24"
+}
+
+# ---------------------------------------------------------------- block / unblock
+# Cut an address off in both directions, and keep a list for the incident report.
+# Safety: it will not block this box, your own SSH session, the default gateway or a
+# DNS server. Never block the scoring engine: check the packet for its address.
+valid_ip() {   # an IPv4 address, or address/bits
+    printf '%s\n' "$1" | grep -E -q '^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$' || return 1
+    printf '%s\n' "${1%/*}" | awk -F. '{exit !($1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255)}'
+}
+
+fw_firewalld() { have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; }
+
+fw_block() {
+    if fw_firewalld; then
+        firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -d "$1" -j DROP >/dev/null 2>&1 &&
+            firewall-cmd --direct --add-rule ipv4 filter INPUT 0 -s "$1" -j DROP >/dev/null 2>&1 || return 1
+        firewall-cmd --permanent --direct --add-rule ipv4 filter OUTPUT 0 -d "$1" -j DROP >/dev/null 2>&1
+        firewall-cmd --permanent --direct --add-rule ipv4 filter INPUT 0 -s "$1" -j DROP >/dev/null 2>&1
+        return 0
+    fi
+    if have iptables && iptables -S OUTPUT >/dev/null 2>&1; then
+        iptables -C OUTPUT -d "$1" -j DROP 2>/dev/null || iptables -I OUTPUT -d "$1" -j DROP || return 1
+        iptables -C INPUT -s "$1" -j DROP 2>/dev/null || iptables -I INPUT -s "$1" -j DROP || return 1
+        return 0
+    fi
+    if have nft; then
+        if ! nft list table inet first30 >/dev/null 2>&1; then
+            nft add table inet first30 &&
+                nft add chain inet first30 in '{ type filter hook input priority -10 ; policy accept ; }' &&
+                nft add chain inet first30 out '{ type filter hook output priority -10 ; policy accept ; }' ||
+                return 1
+        fi
+        nft list chain inet first30 in 2>/dev/null | grep -q "saddr $1 drop" ||
+            nft add rule inet first30 in ip saddr "$1" drop || return 1
+        nft list chain inet first30 out 2>/dev/null | grep -q "daddr $1 drop" ||
+            nft add rule inet first30 out ip daddr "$1" drop || return 1
+        return 0
+    fi
+    return 1
+}
+
+fw_unblock() {
+    if fw_firewalld; then
+        for fu_perm in '' --permanent; do
+            # shellcheck disable=SC2086
+            firewall-cmd $fu_perm --direct --remove-rule ipv4 filter OUTPUT 0 -d "$1" -j DROP >/dev/null 2>&1
+            # shellcheck disable=SC2086
+            firewall-cmd $fu_perm --direct --remove-rule ipv4 filter INPUT 0 -s "$1" -j DROP >/dev/null 2>&1
+        done
+    fi
+    if have iptables; then
+        while iptables -D OUTPUT -d "$1" -j DROP 2>/dev/null; do :; done
+        while iptables -D INPUT -s "$1" -j DROP 2>/dev/null; do :; done
+    fi
+    if have nft && nft list table inet first30 >/dev/null 2>&1; then
+        for fu_ch in in out; do
+            nft -a list chain inet first30 "$fu_ch" 2>/dev/null |
+                awk -v ip="$1" 'index($0, "addr " ip " drop") {print $NF}' |
+                while read -r fu_h; do nft delete rule inet first30 "$fu_ch" handle "$fu_h"; done
+        done
+    fi
+}
+
+do_block() {   # $@ = addresses
+    need_root
+    again=''
+    if [ "$#" -eq 0 ]; then
+        # no address given: put back every saved block (after a reboot or a firewall reload)
+        if [ ! -s "$VAULT/blocked.txt" ]; then
+            say "Usage: sh first30.sh block <address> [<address> ...]"
+            exit 1
+        fi
+        # shellcheck disable=SC2046
+        set -- $(blocked_list)
+        say "Putting back the saved blocks: $*"
+        again=1
+    fi
+    myip=$(printf '%s\n' "$SSH_CLIENT" | awk '{print $1}')
+    gw=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')
+    dns=$(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null)
+    mine=$(ip -4 -o addr 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+    for ip in "$@"; do
+        if ! valid_ip "$ip"; then say "  skipped $ip: not an IPv4 address"; continue; fi
+        case "${ip%/*}" in 127.*|0.*) say "  skipped $ip: that is this box"; continue ;; esac
+        skip=''
+        for keep in $myip $gw $dns $mine; do
+            in_net "$keep" "$ip" && { skip=$keep; break; }
+        done
+        if [ -n "$skip" ]; then
+            say "  skipped $ip: it covers $skip (this box, your SSH session, the default gateway, or a DNS server)"
+            continue
+        fi
+        if fw_block "$ip"; then
+            now=$(date -u '+%Y-%m-%d %H:%M')
+            if [ -z "$again" ]; then
+                printf '%s %s UTC %s\n' "$ip" "$now" "$HOST" >> "$VAULT/blocked.txt"
+                autonote "blocked $ip in and out"
+            fi
+            say "  blocked $ip in and out, at $now UTC on $HOST"
+        else
+            say "  could not block $ip: no working iptables, nft or firewalld on this box"
+        fi
+    done
+    say ""
+    say "For the incident report: the time, $HOST, the address, and what it was doing"
+    say "(C2 traffic is T1071, password guessing is T1110). Where else it shows up: sh first30.sh trace <address>"
+    say "The list is in $VAULT/blocked.txt. After a reboot, run: sh first30.sh block"
+    say "To undo one: sh first30.sh unblock <address>"
+}
+
+do_unblock() {   # $@ = addresses
+    need_root
+    if [ "$#" -eq 0 ]; then
+        say "Usage: sh first30.sh unblock <address>"
+        exit 1
+    fi
+    for ip in "$@"; do
+        if ! valid_ip "$ip"; then say "  skipped $ip: not an IPv4 address"; continue; fi
+        fw_unblock "$ip"
+        if [ -f "$VAULT/blocked.txt" ]; then
+            awk -v ip="$ip" '$1 != ip' "$VAULT/blocked.txt" > "$VAULT/blocked.txt.new" &&
+                mv "$VAULT/blocked.txt.new" "$VAULT/blocked.txt"
+        fi
+        autonote "unblocked $ip"
+        say "  unblocked $ip"
+    done
+}
+
+# ---------------------------------------------------------------- quiet (terminal spam)
+# Red team floods terminals: wall writes to every terminal at once, write to one.
+# Both are setgid-tty programs, so taking away all their permissions (000) stops
+# every account that is not root, and killing the ones running stops spam in
+# progress. Every open terminal is set to 600 (the same as mesg n), and the console
+# screens (/dev/vcs*, what is shown in the Proxmox console) to 600, so only root
+# can read them. Root can still write straight to a terminal: spam that keeps
+# coming after this is from a root session. Find it with who -u and kill it.
+do_quiet() {
+    need_root
+    : >> "$QUIET_UNDO"
+    for p in $SPAM_PROGS; do
+        f=$(command -v "$p" 2>/dev/null) || continue
+        r=$(readlink -f "$f" 2>/dev/null)
+        [ -n "$r" ] || r=$f
+        [ -f "$r" ] || continue
+        grep -q " $r\$" "$QUIET_UNDO" || printf '%s %s\n' "$(stat -c %a "$r")" "$r" >> "$QUIET_UNDO"
+        chmod 000 "$r" && say "  $p ($r): turned off (mode 000; it was $(awk -v f="$r" '$2 == f {print $1}' "$QUIET_UNDO"))"
+    done
+    for p in $SPAM_PROGS bsd-write write.ul; do
+        pkill -9 -x "$p" 2>/dev/null && say "  killed the running $p"
+    done
+    # /dev/vcs* = the text on each console screen, /dev/fb* = the picture on it
+    n=0
+    for v in /dev/vcs* /dev/fb[0-9]*; do
+        [ -c "$v" ] || continue
+        grep -q " $v\$" "$QUIET_UNDO" || printf '%s %s\n' "$(stat -c %a "$v")" "$v" >> "$QUIET_UNDO"
+        chmod 600 "$v" && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && say "  console screens (/dev/vcs*, /dev/fb*): only root can read them now ($n devices)"
+    n=0
+    for t in /dev/pts/[0-9]*; do
+        [ -c "$t" ] && chmod 600 "$t" && n=$((n + 1))
+    done
+    for t in /dev/tty[1-9]*; do [ -c "$t" ] && chmod 600 "$t"; done
+    say "  SSH terminals open now ($n) and the consoles: set to 600, like mesg n (new logins start at the normal setting)"
+    chmod 600 "$QUIET_UNDO"
+    autonote "turned on spam protection: wall and write off, terminals and console screens 600 (undo: sh first30.sh undo-quiet)"
+    say ""
+    say "Done. If messages still appear, they come from a root session. Find it with: who -u"
+    say "then kill it (pkill -9 -t pts/<number>) and change root's password. /dev settings reset at reboot: run this again then."
+    say "To undo: sh first30.sh undo-quiet"
+}
+
+do_undo_quiet() {
+    need_root
+    if [ ! -s "$QUIET_UNDO" ]; then say "Nothing to undo: spam protection was not turned on with this script."; exit 1; fi
+    while read -r qm qf; do
+        [ -e "$qf" ] && chmod "$qm" "$qf" && say "  $qf: back to mode $qm"
+    done < "$QUIET_UNDO"
+    rm -f "$QUIET_UNDO"
+    autonote "turned spam protection off (undo-quiet)"
+}
+
+# ---------------------------------------------------------------- notes
+do_note() {
+    need_root
+    if [ -z "$*" ]; then
+        say "Usage: sh first30.sh note \"what you did, and why\""
+        exit 1
+    fi
+    printf '%s  %s  %s: %s\n' "$(now_utc)" "$HOST" "${SUDO_USER:-root}" "$*" >> "$NOTES"
+    chmod 600 "$NOTES"
+    say "Saved in $NOTES:"
+    tail -n 1 "$NOTES" | sed 's/^/  /'
+    say "The next hunt shows it next to the changes, so everyone knows this one was yours."
+}
+
+do_notes() {
+    need_root
+    if [ -s "$NOTES" ]; then sed 's/^/  /' "$NOTES"; else say "No notes yet. Write one: sh first30.sh note \"what you did\""; fi
+}
+
+do_nets() {
+    need_root
+    if [ "$#" -eq 0 ]; then
+        if [ -s "$VAULT/ournets.txt" ]; then say "Your networks: $(cat "$VAULT/ournets.txt")"
+        else say "No networks saved. Example: sh first30.sh nets 10.100.130.0/24 192.168.220.0/24"; fi
+        return 0
+    fi
+    for n in "$@"; do valid_ip "$n" || { say "Not an IPv4 network: $n (example: 10.100.130.0/24)"; exit 1; }; done
+    say "$*" > "$VAULT/ournets.txt"
+    chmod 600 "$VAULT/ournets.txt"
+    say "Saved. Addresses outside $* are now marked in hunt, c2 and the login check."
+}
+
+# ---------------------------------------------------------------- evidence
+# Copy a suspicious file (or a running program, even one whose file was deleted)
+# into the vault with its fingerprint and everything that uses it. The original is
+# not touched. This is what you need for the incident report, before cleaning up.
+do_evidence() {
+    need_root
+    ev=$1
+    if [ -z "$ev" ]; then
+        say "Usage: sh first30.sh evidence /full/path/to/file"
+        say "   or: sh first30.sh evidence /proc/<pid>/exe   (a running program, even if its file was deleted)"
+        exit 1
+    fi
+    qd="$VAULT/quarantine"
+    mkdir -p "$qd" && chmod 700 "$qd"
+    st=$(date -u +%Y%m%d-%H%M%S)
+    case "$ev" in
+        /proc/[0-9]*/exe)
+            evp=${ev#/proc/}; evp=${evp%/exe}
+            evr=$(readlink "$ev" 2>/dev/null) || { say "No such process: $evp"; exit 1; }
+            src=$ev
+            say "Process $evp runs: $evr" ;;
+        *)
+            if [ ! -e "$ev" ] && [ ! -L "$ev" ]; then say "Not found: $ev"; exit 1; fi
+            evr=$(readlink -f "$ev" 2>/dev/null || echo "$ev")
+            src=$evr ;;
+    esac
+    name=$(basename "${evr% (deleted)}")
+    dest="$qd/${st}_${HOST}_$name.evidence"
+    if [ -d "$src" ]; then
+        dest="$dest.tgz"
+        tar -czf "$dest" -C "$(dirname "$src")" "$name" 2>/dev/null
+        h=$(sha256sum "$dest" | cut -d' ' -f1)
+    else
+        cat "$src" > "$dest" 2>/dev/null || { say "Could not read $src"; rm -f "$dest"; exit 1; }
+        h=$(sha256sum "$dest" | cut -d' ' -f1)
+    fi
+    chmod 400 "$dest"
+    {
+        say "== Evidence saved $(now_utc) on $HOST"
+        say "original : $evr"
+        say "copy     : $dest   (it cannot run from there; the original was not touched)"
+        say "sha256   : $h"
+        [ -e "$src" ] && say "file     : $(ls -ld "$src" 2>/dev/null)"
+        [ -e "${evr% (deleted)}" ] && say "times    : $(stat -c 'changed %z | modified %y' "${evr% (deleted)}" 2>/dev/null)"
+        have file && say "type     : $(file -b "$dest" 2>/dev/null)"
+        if [ -e "${evr% (deleted)}" ]; then
+            from_package "${evr% (deleted)}"
+            case $? in
+                0) say "package  : $(pkg_owner "${evr% (deleted)}")" ;;
+                1) say "package  : NONE (no package installed this file)" ;;
+            esac
+            [ -n "$(lsattr -d "${evr% (deleted)}" 2>/dev/null | awk '$1 ~ /[ia]/')" ] && say "locked   : yes (chattr +i or +a; unlock with chattr -i before removing)"
+        fi
+        say "running  :"
+        proc_table
+        awk -v f="${evr% (deleted)}" '{p = $1; $1 = ""; sub(/^ /, ""); sub(/ \(deleted\)$/, ""); if ($0 == f) print p}' "$PTAB" |
+            while read -r p; do say "    pid $p ($(ps -o user=,args= -p "$p" 2>/dev/null))"; done
+        say "open by  :"
+        ls -l /proc/[0-9]*/fd 2>/dev/null | awk -v f="${evr% (deleted)}" '
+            /^\/proc\/[0-9]+\/fd:$/ {p = $0; sub(/^\/proc\//, "", p); sub(/\/fd:$/, "", p); next}
+            {n = length(f); if (substr($0, length($0) - n + 1) == f && index($0, " -> " f)) print "    pid " p}' | sort -u
+        say "named in (services, cron, startup files):"
+        grep -r -l -F -- "${evr% (deleted)}" /etc/systemd /lib/systemd/system /usr/lib/systemd/system /etc/cron* \
+            /var/spool/cron /etc/rc.local /etc/init.d /etc/profile.d /etc/ld.so.preload /etc/environment \
+            /etc/pam.d /etc/sudoers.d /root/.bashrc /root/.profile 2>/dev/null | sed 's/^/    /'
+        say ""
+    } | tee -a "$qd/evidence_log.txt"
+    chmod 600 "$qd/evidence_log.txt"
+    autonote "saved evidence: $evr (sha256 $(printf '%s' "$h" | cut -c1-16)...)"
+    say "Next, with your lead:"
+    say "  1. Write it down: the time, $HOST, the path, the sha256 above, and what it did (MITRE number)."
+    say "  2. Stop what runs it: kill <pid>, or systemctl disable --now <service>."
+    say "  3. Remove what starts it again (the service file, cron line or drop-in named above)."
+    say "  4. Only then delete or move the original."
+    say "The log of everything saved: $qd/evidence_log.txt"
+}
+
+# ---------------------------------------------------------------- trace
+# Where has an address shown up on this box? Searches the logs for it, like the
+# find_malicious_ip example in the threat-hunting guide, and gives the first and
+# last time it was seen (what the incident report needs).
+do_trace() {
+    need_root
+    tip=$1
+    if ! valid_ip "$tip"; then say "Usage: sh first30.sh trace <IPv4 address>"; exit 1; fi
+    say "== Where has $tip shown up on $HOST? (first seen and last seen, for the incident report)"
+    tf=0
+    for f in /var/log/auth.log /var/log/auth.log.1 /var/log/secure /var/log/secure-* /var/log/syslog /var/log/syslog.1 \
+        /var/log/messages /var/log/messages-* /var/log/kern.log /var/log/ufw.log /var/log/audit/audit.log \
+        /var/log/apache2/*.log /var/log/httpd/*log /var/log/nginx/*.log /var/log/mysql/*.log /var/log/mail.log; do
+        [ -f "$f" ] || continue
+        n=$(grep -c -F -w -- "$tip" "$f" 2>/dev/null)
+        [ "${n:-0}" -gt 0 ] || continue
+        tf=1
+        say "  $f: $n lines"
+        say "    first: $(grep -F -w -m 1 -- "$tip" "$f" | cut -c1-220)"
+        say "    last:  $(grep -F -w -- "$tip" "$f" | tail -n 1 | cut -c1-220)"
+    done
+    if have journalctl; then
+        jt="$VAULT/.trace.$$"
+        journalctl --no-pager -q -b 2>/dev/null | grep -F -w -- "$tip" > "$jt"
+        if [ -s "$jt" ]; then
+            tf=1
+            say "  the journal (this boot): $(wc -l < "$jt") lines"
+            say "    first: $(head -n 1 "$jt" | cut -c1-220)"
+            say "    last:  $(tail -n 1 "$jt" | cut -c1-220)"
+        fi
+        rm -f "$jt"
+    fi
+    [ "$tf" = 0 ] && say "  not in the logs (older logs ending in .gz are not searched: zgrep $tip /var/log/*.gz)"
+    say "== Right now"
+    rn=$(ss -tnp 2>/dev/null | grep -F -w -- "$tip")
+    if [ -n "$rn" ]; then say "$rn" | sed 's/^/  /'; else say "  no open connection with $tip"; fi
+    if blocked_list | grep -q -x -F -- "$tip"; then say "  blocked: yes ($(grep -F -- "$tip" "$VAULT/blocked.txt" | head -1))"
+    else say "  blocked: no. To block it: sh first30.sh block $tip"; fi
+    say "Write it down: sh first30.sh note \"$tip: first seen ..., last seen ..., did ...\""
+}
+
+# ---------------------------------------------------------------- bait
+# A honeytoken: a file that looks like it holds an old password. Nobody on your
+# team ever opens it, so anyone who does is red team. auditd logs who opened it,
+# and the made-up login name inside shows in the login log if they try it.
+# Plant it BEFORE running auditd mode, so the watch goes in before the rules lock.
+do_bait() {
+    need_root
+    bp=$1
+    if [ -z "$bp" ]; then
+        if [ -n "$BAIT" ]; then say "Bait planted: $BAIT (login name $BAITUSER)"; else
+            say "Usage: sh first30.sh bait /root/<a believable name only your team knows>"
+            say "   for example /root/db_backup_creds.txt or /opt/app/.old_admin_login"
+        fi
+        return 0
+    fi
+    case "$bp" in
+        /root/*|/home/*|/opt/*|/srv/*|/var/backups/*) ;;
+        *) say "Put the bait under /root, /home, /opt, /srv or /var/backups."
+           say "This script reads /etc and /tmp itself, which would set the bait off."; exit 1 ;;
+    esac
+    case "$bp" in "$VAULT"/*|/root/.ssh/*|/home/*/.ssh/*) say "Not inside the vault or an .ssh folder. Pick another place."; exit 1 ;; esac
+    if [ -n "$BAIT" ]; then say "A bait is already planted: $BAIT. One per box."; exit 1; fi
+    if [ -e "$bp" ]; then say "$bp already exists. Pick a new file name."; exit 1; fi
+    if [ ! -d "$(dirname "$bp")" ]; then say "The folder $(dirname "$bp") does not exist."; exit 1; fi
+    bn=$(( $(date +%s) % 90 + 10 ))
+    for bw in backup deploy report monitor sync; do
+        bu="svc_$bw$bn"
+        grep -q "^$bu:" /etc/passwd || break
+    done
+    bpw=$(od -An -tx1 -N 8 /dev/urandom 2>/dev/null | tr -d ' \n')
+    {
+        say "# old service login - moved to the vault, do not use"
+        say "host=$HOST"
+        say "user=$bu"
+        say "password=${bpw:-Winter2026!x}"
+    } > "$bp"
+    chmod 644 "$bp"
+    say "$bp $bu $(date -u +%Y-%m-%dT%H:%M)" > "$VAULT/bait.txt"
+    chmod 600 "$VAULT/bait.txt"
+    BAIT=$bp BAITUSER=$bu
+    autonote "planted the bait (details in $VAULT/bait.txt)"
+    say "Bait planted: $bp   (made-up login name inside: $bu)"
+    if have auditctl && audit_running && [ "$(audit_enabled)" != 2 ]; then
+        auditctl -w "$bp" -p rwa -k bait >/dev/null 2>&1 && say "auditd now logs anyone who opens it."
+        say "Now lock auditd with the bait in its rules: sh first30.sh auditd"
+    elif [ "$(audit_enabled 2>/dev/null)" = 2 ]; then
+        say "auditd's rules are already locked, so opening the bait is NOT logged until a reboot."
+        say "The bait login name still works: the hunt looks for it in the login log."
+    else
+        say "Next: sh first30.sh auditd   (it adds the bait to the audit rules, then locks them)"
+    fi
+    say "Never open the bait yourself. Do not tell anyone where it is outside your team."
+}
+
+# ---------------------------------------------------------------- menu
+pause() {
+    say ""
+    say "Press Enter to go back to the menu."
+    read -r _ || exit 0
+}
+
+ask() {   # ask "question" -> answer in $ANS
+    say ""
+    say "$1"
+    read -r ANS || exit 0
+}
+
+menu_header() {
+    say ""
+    say "======================================================================"
+    say "first30 on $HOST ($(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2))   $(date '+%H:%M')"
+    if [ -f "$BASE" ]; then
+        say "Baseline: made $(date -r "$BASE" '+%H:%M'), seal $(seal "$BASE") (must match your paper)"
+        if [ -f "$VAULT/.stamp_$HOST" ]; then
+            mago=$(( ($(date +%s) - $(date -r "$VAULT/.stamp_$HOST" +%s)) / 60 ))
+            mw='minutes'; [ "$mago" = 1 ] && mw='minute'
+            if [ "$mago" -ge 30 ]; then say "Last hunt: $mago $mw ago  <- time to hunt (choice 2)"
+            else say "Last hunt: $mago $mw ago"; fi
+        else
+            say "No hunt yet. Hunt every 30 minutes (choice 2)."
+        fi
+    else
+        say "No baseline yet: start with choice 1."
+    fi
+    if [ -n "$OURNETS" ]; then say "Your networks: $OURNETS"; else say "Your networks: not set (choice N)"; fi
+    if [ -n "$LEARN" ]; then lm='ON: each check shows the command behind it'; else lm='off'; fi
+    say "Learn mode: $lm"
+    say "----------------------------------------------------------------------"
+    say "  1  Start of game: inventory, baseline and backup   (read only; saves copies)"
+    say "  2  Hunt: what changed? Run every 30 minutes         (read only)"
+    say "  3  Find C2: programs calling out (takes 30 seconds) (read only)"
+    say "  4  Trace an address: where has it shown up?        (read only)"
+    say "  5  Save evidence: copy a suspicious file safely     (the original is not touched)"
+    say "  6  Write a team note: what you changed and why"
+    say "  7  Show the team notes"
+    say "  8  Block an address, in and out                    CHANGES the firewall"
+    say "  9  Unblock an address                              CHANGES the firewall"
+    say " 10  Plant a bait file (do this before 12)           CHANGES: adds one file"
+    say " 11  Stop terminal spam and screen reading           CHANGES permissions (wall, write, terminals)"
+    say " 12  Turn on and lock auditd, the audit log          CHANGES the box (ask your lead)"
+    say " 13  Turn off root login over SSH                    CHANGES sshd (ask your lead)"
+    say "  N  Set your team's networks (from the packet)"
+    say "  L  Learn mode on/off"
+    say "  Q  Quit"
+    say "Type a choice and press Enter:"
+}
+
+do_menu() {
+    need_root
+    [ -z "$LEARN" ] && LEARN=1
+    [ "$LEARN" = 0 ] && LEARN=''
+    while :; do
+        menu_header
+        read -r ch || exit 0
+        case "$ch" in
+            1) ( do_recon; say ""; do_backup ); pause ;;
+            2) ( do_hunt ); pause ;;
+            3) ( do_c2 ); pause ;;
+            4) ask "Address to trace (like 10.197.114.55):"; ( do_trace "$ANS" ); pause ;;
+            5) ask "Full path of the file, or /proc/<pid>/exe for a running program:"; ( do_evidence "$ANS" ); pause ;;
+            6) ask "Type the note and press Enter (example: changed root password; removed /etc/sudoers.d/domain-users):"
+               [ -n "$ANS" ] && ( do_note "$ANS" ); pause ;;
+            7) ( do_notes ); pause ;;
+            8) ask "Address to block (like 10.197.114.55). Never the scoring engine:"
+               ba=$ANS
+               ask "Block $ba in and out of $HOST? Type yes to go ahead:"
+               [ "$ANS" = yes ] && ( do_block "$ba" ); pause ;;
+            9) ask "Address to unblock:"; ba=$ANS
+               ask "Unblock $ba? Type yes to go ahead:"
+               [ "$ANS" = yes ] && ( do_unblock "$ba" ); pause ;;
+            10) ask "Where should the bait go? A believable name only your team knows, like /root/db_backup_creds.txt:"
+                [ -n "$ANS" ] && ( do_bait "$ANS" ); pause ;;
+            11) say ""; say "This turns off wall and write (chmod 000), kills running ones, and makes terminals and console screens 600."
+                ask "Type yes to go ahead:"
+                [ "$ANS" = yes ] && ( do_quiet ); pause ;;
+            12) say ""; say "This installs auditd if needed, writes its rules, and LOCKS them until a reboot."
+                ask "Did your lead say yes? Type yes to go ahead:"
+                [ "$ANS" = yes ] && ( do_auditd ); pause ;;
+            13) say ""; say "This turns off root login over SSH. If SSH is scored and logs in as root, do NOT do this."
+                ask "Did your lead say yes? Type yes to go ahead:"
+                [ "$ANS" = yes ] && ( do_ssh ); pause ;;
+            [Nn]) ask "Your team's networks from the packet, separated by spaces (like 10.100.130.0/24 192.168.220.0/24):"
+                  if [ -n "$ANS" ]; then
+                      # shellcheck disable=SC2086
+                      ( do_nets $ANS ) && OURNETS=$(cat "$VAULT/ournets.txt" 2>/dev/null)
+                  fi; pause ;;
+            [Ll]) if [ -n "$LEARN" ]; then LEARN=''; else LEARN=1; fi ;;
+            [Qq]) exit 0 ;;
+            '') ;;
+            *) say "Pick one of the choices in the list." ;;
+        esac
+    done
+}
+
+usage() {
+    say "first30.sh - run it with no mode for the menu:  sudo sh first30.sh"
+    say ""
+    say "Usage: sh first30.sh MODE"
+    say "  recon         inventory + baseline (read only)"
+    say "  backup        tar of configs, web roots, homes, cron (skips what is missing)"
+    say "  all           recon, then backup"
+    say "  hunt          what changed since the last hunt, plus every check (run every 30 minutes)"
+    say "  c2            programs calling out to a C2 server (watches for 30 seconds)"
+    say "  trace IP      where an address shows up in the logs, first and last time"
+    say "  evidence F    copy a suspicious file (or /proc/<pid>/exe) into the vault with its fingerprint"
+    say "  note \"text\"   add a line to the team notes;  notes  shows them"
+    say "  nets NETS     save your team's networks, like: nets 10.100.130.0/24 192.168.220.0/24"
+    say "  block IP      cut an address off, in and out (no IP: put the saved blocks back)"
+    say "  unblock IP    remove a block"
+    say "  bait FILE     plant a bait file (before auditd)"
+    say "  auditd        install (if needed), set up and lock auditd, the audit log"
+    say "  ssh           turn off root login over SSH, with safety checks;  undo-ssh  puts it back"
+    say "  quiet         stop terminal spam: wall and write off, terminals and console screens 600;  undo-quiet"
+    say ""
+    say "Learn mode for any mode: sh first30.sh learn hunt"
+    say "Run it from your own machine so no copy sits on the box:  ssh root@<box> 'sh -s hunt' < first30.sh"
+}
+
+main() {
+    case "$1" in
+        learn) shift; LEARN=1; main "$@" ;;
+        recon) do_recon ;;
+        backup) do_backup ;;
+        all) do_recon; say ""; do_backup ;;
+        hunt) do_hunt ;;
+        auditd) do_auditd ;;
+        c2) do_c2 ;;
+        block) shift; do_block "$@" ;;
+        unblock) shift; do_unblock "$@" ;;
+        ssh) do_ssh ;;
+        undo-ssh) do_undo_ssh ;;
+        quiet) do_quiet ;;
+        undo-quiet) do_undo_quiet ;;
+        note) shift; do_note "$*" ;;
+        notes) do_notes ;;
+        nets) shift; do_nets "$@" ;;
+        evidence) shift; do_evidence "$1" ;;
+        trace) shift; do_trace "$1" ;;
+        bait) shift; do_bait "$1" ;;
+        menu|'') if [ -t 0 ]; then do_menu; else usage; exit 1; fi ;;
+        *) usage; exit 1 ;;
+    esac
+}
+
+main "$@" | sanitize
